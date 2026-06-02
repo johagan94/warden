@@ -57,6 +57,7 @@ SEARCH_SETTINGS_SCHEMA: SchemaMap = {
     "interleave_types": {"default": True, "type": bool},
     "max_queue_size": {"default": 0, "type": int, "min_value": 0},
     "missing_batch_size": {"default": 20, "type": int, "allow_special_values": True},
+    "queue_check_timeout_seconds": {"default": 15, "type": int, "min_value": 1},
     "radarr_collection_search_mode": {"default": "off", "type": str, "choices": ("off", "detect", "force")},
     "retry_interval_days": {"default": 30, "type": int, "min_value": 0},
     "retry_interval_days_missing": {"default": None, "type": int, "min_value": 0},
@@ -279,17 +280,19 @@ def parse_config(config: ConfigMap) -> ConfigMap:
 
     # Section name: "vigilance" matches the WARDEN_MODE name for the search
     # loop; "global" is kept as a backward-compat alias.
-    search_settings = cast(ConfigMap, dict(config.get("vigilance", config.get("global", {}))))
-    if not isinstance(search_settings, dict):
+    raw_search_settings = config.get("vigilance", config.get("global", {}))
+    if not isinstance(raw_search_settings, dict):
         raise ValueError("'vigilance' (or legacy 'global') must be a YAML mapping.")
+    search_settings = cast(ConfigMap, dict(raw_search_settings))
     _apply_interval_conversions(search_settings)
     _validate_search_settings(search_settings, SEARCH_SETTINGS_SCHEMA)
 
     # Section name: "defence" matches the WARDEN_MODE name for the cleanup
-    # loop; "cleanup" and "killarr" are kept as backward-compat aliases.
-    cleanup_settings = cast(ConfigMap, dict(config.get("defence", config.get("cleanup", config.get("killarr", {})))))
-    if not isinstance(cleanup_settings, dict):
-        raise ValueError("'defence' (or legacy 'cleanup'/'killarr') must be a YAML mapping.")
+    # loop; "cleanup" is kept as a backward-compat alias.
+    raw_cleanup_settings = config.get("defence", config.get("cleanup", config.get("killarr", {})))
+    if not isinstance(raw_cleanup_settings, dict):
+        raise ValueError("'defence' (or legacy 'cleanup') must be a YAML mapping.")
+    cleanup_settings = cast(ConfigMap, dict(raw_cleanup_settings))
     _validate_cleanup_settings(cleanup_settings, CLEANUP_SETTINGS_SCHEMA)
     _validate_stall_actions(cleanup_settings)
 

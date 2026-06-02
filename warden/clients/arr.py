@@ -83,6 +83,7 @@ class ArrClient(ABC):
         self.fetch_page_size = search_settings.get("fetch_page_size", self.DEFAULT_FETCH_PAGE_SIZE)
         self.fetch_record_limit = search_settings.get("fetch_record_limit", 0)
         self.fetch_timeout = search_settings.get("fetch_timeout_seconds", 120)
+        self.queue_check_timeout = search_settings.get("queue_check_timeout_seconds", 15)
         self.stagger_seconds = search_settings.get("stagger_interval_seconds", 30)
         self.search_order = search_settings.get("search_order", "last_searched_ascending")
         self.retry_interval_days = search_settings.get("retry_interval_days", 30)
@@ -474,7 +475,7 @@ class ArrClient(ABC):
         try:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
             params: RequestParams = {"page": 1, "pageSize": 1, "includeUnknownSeriesItems": "false"}
-            response = self.session.get(url, params=params, timeout=self.fetch_timeout)
+            response = self.session.get(url, params=params, timeout=self.queue_check_timeout)
             response.raise_for_status()
             total = cast(int, response.json().get("totalRecords", 0))
             if total >= self.max_queue_size:
@@ -488,8 +489,9 @@ class ArrClient(ABC):
     def is_queue_too_large(self) -> bool:
         return not self._check_queue_size()
 
-    def _fetch_all_queue(self) -> list[Record]:
+    def _fetch_all_queue(self) -> tuple[list[Record], bool]:
         result: list[Record] = []
+        fetch_failed = False
         current_page = 1
         page_size = self.cleanup_page_size
         record_cap = self.max_cleanup_queue_records
@@ -512,8 +514,9 @@ class ArrClient(ABC):
                 current_page += 1
             except requests.RequestException as error:
                 logger.error(f"[{self.name}] Failed to fetch queue: {error}")
+                fetch_failed = True
                 break
-        return result
+        return result, fetch_failed
 
     def _is_healthy_in_progress(self, record: Record) -> bool:
         """Whether the download client reports this item as healthy and still in flight.
@@ -589,7 +592,9 @@ class ArrClient(ABC):
             return [], empty_stats
 
         try:
-            all_records = self._fetch_all_queue()
+            all_records, fetch_failed = self._fetch_all_queue()
+            if fetch_failed:
+                self.circuit_breaker.record_failure(f"{self.name}_cleanup")
             skip_series_ids = self._get_skip_series_ids(all_records)
             items: list[QueueItem] = []
             skip_stats = {
@@ -613,22 +618,27 @@ class ArrClient(ABC):
                     continue
 
                 status = record.get("status", "")
+                messages: list[str]
                 if status == "downloadClientUnavailable":
                     category = "download_unavailable"
                     messages = []
                     action = self._resolve_cleanup_action(category)
                 else:
-                    messages: list[str] = list(
+                    messages = list(
                         dict.fromkeys(
                             msg for msg_obj in record.get("statusMessages", []) for msg in msg_obj.get("messages", [])
                         )
                     )
                     category = classify_stall(messages)
+                    action = self._resolve_cleanup_action(category)
                     if category == "unknown":
-                        logger.warning(
+                        log_message = (
                             f'[{self.name}] Unrecognized status messages for "{title}" — please report: {messages}'
                         )
-                    action = self._resolve_cleanup_action(category)
+                        if action == "ignore":
+                            logger.debug(log_message)
+                        else:
+                            logger.warning(log_message)
 
                 if action == "ignore":
                     logger.debug(f"[{self.name}] Skipping stalled item (action: ignore, category: {category}): {title}")
@@ -653,7 +663,8 @@ class ArrClient(ABC):
                 if self.cleanup_batch_size > 0 and len(items) >= self.cleanup_batch_size:
                     break
 
-            self.circuit_breaker.record_success(f"{self.name}_cleanup")
+            if not fetch_failed:
+                self.circuit_breaker.record_success(f"{self.name}_cleanup")
             return items, skip_stats
         except Exception:
             self.circuit_breaker.record_failure(f"{self.name}_cleanup")
@@ -1336,7 +1347,7 @@ class SonarrClient(ArrClient):
         stats = series.get("statistics", {}) or {}
         return cast(int, stats.get("episodeCount", 0)) > cast(int, stats.get("episodeFileCount", 0))
 
-    def _get_media_to_search_by_tag_limits(self, missing_batch_size: int) -> list[MediaItem]:
+    def _get_media_to_search_by_tag_limits(self, missing_batch_size: int, upgrade_batch_size: int) -> list[MediaItem]:
         """Series-centric, per-tag-capped, rotating selection.
 
         Fetches the series list once (instead of paging the entire wanted/missing set),
@@ -1350,8 +1361,9 @@ class SonarrClient(ArrClient):
         de-duplicated within a cycle, so a series carrying two capped tags is searched
         once and the other tag fills its remaining cap with distinct series.
         """
+        upgrade_items = self._get_media_to_search_by_series(0, upgrade_batch_size)
         if missing_batch_size == 0:
-            return []
+            return upgrade_items
         series_list = self._fetch_list(self.ENDPOINT_SERIES)
         buckets: dict[int, list[Record]] = {tag_id: [] for tag_id in self._tag_limit_ids}
         for series in series_list:
@@ -1391,7 +1403,7 @@ class SonarrClient(ArrClient):
             self._tag_search_cursor[tag_id] = (start + scanned) % len(bucket)
         if self.search_order == "random":
             random.shuffle(items)
-        return items
+        return self._interleave_items(items, upgrade_items)
 
     def _get_media_to_search_by_series(self, missing_batch_size: int, upgrade_batch_size: int) -> list[MediaItem]:
         seen_series: set[int] = set()
@@ -1464,7 +1476,7 @@ class SonarrClient(ArrClient):
             return []
         try:
             if self._tag_limit_ids:
-                result = self._get_media_to_search_by_tag_limits(missing_batch_size)
+                result = self._get_media_to_search_by_tag_limits(missing_batch_size, upgrade_batch_size)
                 self.circuit_breaker.record_success(self.name)
                 return result
             if self.search_type == "series":

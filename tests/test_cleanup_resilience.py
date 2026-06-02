@@ -83,6 +83,32 @@ class TestProtectHealthyDownloads:
         assert client._is_healthy_in_progress({"status": "downloading", "trackedDownloadStatus": "warning"}) is False
 
 
+class TestCleanupFetchCircuitBreaker:
+    def test_queue_fetch_timeout_counts_toward_cleanup_circuit_breaker(self) -> None:
+        client = _sonarr(circuit_breaker_threshold=2)
+        client.circuit_breaker.threshold = 2
+        calls = 0
+
+        def get(url, *, params, timeout):
+            nonlocal calls
+            calls += 1
+            raise requests.ReadTimeout("queue timed out")
+
+        client.session.get = get
+
+        first_items, first_stats = client.get_stalled_items()
+        second_items, second_stats = client.get_stalled_items()
+        third_items, third_stats = client.get_stalled_items()
+
+        assert first_items == []
+        assert second_items == []
+        assert third_items == []
+        assert first_stats["total_evaluated"] == 0
+        assert second_stats["total_evaluated"] == 0
+        assert third_stats["total_evaluated"] == 0
+        assert calls == 2
+
+
 # --------------------------------------------------------------------------- #
 # Removal: fallback (blocklist -> plain remove) + cooldown on failure
 # --------------------------------------------------------------------------- #
