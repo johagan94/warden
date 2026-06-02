@@ -98,6 +98,7 @@ vigilance:                          # legacy alias: global
   fetch_page_size: 2000             # Records per API request
   fetch_record_limit: 0             # Cap records pulled per wanted fetch (0 = unlimited)
   fetch_timeout_seconds: 120        # HTTP request timeout
+  queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
   max_queue_size: 500               # Pause if queue >= this (0 = disabled)
   circuit_breaker_threshold: 3      # Skip instance after N consecutive failures
   interleave_instances: false       # Alternate between instances in search queue
@@ -159,7 +160,7 @@ instances:
 Configure how Warden defends your library from problematic downloads:
 
 ```yaml
-defence:                            # legacy aliases: cleanup / killarr
+defence:                            # legacy alias: cleanup
   dry_run: false                    # Log intended removals without deleting queue items
   active_hours: ""                  # Optional local-time window, e.g. "22:00-06:00"
   interval: 600                     # Run every 10 minutes
@@ -235,7 +236,7 @@ defence:
 
 #### Per-Instance Overrides
 
-Any vigilance or defence setting can be overridden per instance (legacy `global`/`cleanup`/`killarr` names still accepted):
+Any vigilance or defence setting can be overridden per instance (legacy `global`/`cleanup` names still accepted):
 
 ```yaml
 instances:

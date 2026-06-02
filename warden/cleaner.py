@@ -1,4 +1,4 @@
-"""Killarr cleanup orchestration: stalled download detection and removal across *arr instances."""
+"""Defence cleanup orchestration: stalled download detection and removal across *arr instances."""
 
 import datetime
 import logging
@@ -100,7 +100,7 @@ def _log_cleaner_start(active_clients: list[Any], settings: dict[str, Any]) -> N
     action_str = ", ".join(f"{category}={action}" for category, action in stall_actions.items())
 
     logger.info(
-        f"Killarr-Cleanup started{dry_run_str} | "
+        f"Warden-Defence started{dry_run_str} | "
         f"Instances: {len(active_clients)} active | "
         f"Run Interval: {_get_setting(settings, 'interval')}s | "
         f"Batch: {batch_str} | "

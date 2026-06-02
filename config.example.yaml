@@ -1,7 +1,7 @@
 # Warden — Unified Configuration
 # Two sections: "vigilance" (search) and "defence" (cleanup).
 # WARDEN_MODE=warden runs both; =vigilance or =defence runs one only.
-# Legacy section names (global / cleanup / killarr) and legacy mode values
+# Legacy section names (global / cleanup) and legacy mode values
 # (both / search / cleanup) are still accepted.
 
 # ---------------------------------------------------------------------------
@@ -27,6 +27,7 @@ vigilance:
                                     # Protects against huge libraries; for Sonarr prefer
                                     # per-instance tag_limits below.
   fetch_timeout_seconds: 120        # HTTP request timeout
+  queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
   circuit_breaker_threshold: 3      # Skip instance after 3 consecutive fetch failures
   max_queue_size: 500               # Pause searches if queue >= 500 items (0 = disabled)
   api_request_interval_seconds: 2   # Minimum delay between mutating API calls per instance
@@ -39,7 +40,7 @@ vigilance:
   exclude_tags: []                  # Optional *Arr tag labels to exclude
 
 # ---------------------------------------------------------------------------
-# Defence — stalled download cleanup   (legacy aliases: cleanup / killarr)
+# Defence — stalled download cleanup   (legacy alias: cleanup)
 # ---------------------------------------------------------------------------
 defence:
   active_hours: ""                  # Optional local-time window, e.g. "22:00-06:00"

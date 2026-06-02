@@ -1,6 +1,6 @@
 """Tests for Warden unified package."""
 
-from warden.cleaner import run_removal_cycle
+from warden.cleaner import run_cleaner_loop, run_removal_cycle
 from warden.clients.arr import CircuitBreaker, LidarrClient, QueueItem, RadarrClient, SonarrClient
 from warden.config import CLEANUP_SETTINGS_SCHEMA, SEARCH_SETTINGS_SCHEMA, parse_config
 from warden.main import build_arr_clients
@@ -436,6 +436,42 @@ class TestStallClassifier:
         # can never fix a Lidarr metadata dupe); it stays unknown -> ignore on lidarr.
         assert classify_stall(["Unable to import automatically, found multiple artists"]) == "unknown"
 
+    def test_unknown_ignored_items_do_not_warn(self, caplog) -> None:
+        client = LidarrClient(
+            "lidarr",
+            "http://lidarr:8686",
+            "abc123",
+            {"stagger_interval_seconds": 0},
+            {"unknown": "ignore"},
+        )
+        client.session.get = lambda url, *, params, timeout: type(
+            "R",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {
+                    "records": [
+                        {
+                            "id": 1,
+                            "status": "completed",
+                            "trackedDownloadStatus": "warning",
+                            "artist": {"artistName": "Unknown Artist", "tags": []},
+                            "title": "Floating Soulseek Grab",
+                            "statusMessages": [
+                                {"messages": ["Download wasn't grabbed by Lidarr and not in a category, Skipping."]}
+                            ],
+                        },
+                    ]
+                },
+            },
+        )()
+
+        items, stats = client.get_stalled_items()
+
+        assert items == []
+        assert stats["ignored"] == 1
+        assert "Unrecognized status messages" not in caplog.text
+
 
 class TestCleanupRemoval:
     def test_blocklist_removal_triggers_sonarr_episode_search(self) -> None:
@@ -691,7 +727,10 @@ class TestCleanupRemoval:
 
         client.session.get = get
 
-        assert client._fetch_all_queue() == [{"id": 1}, {"id": 2}, {"id": 3}]
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert fetch_failed is False
         assert [call[1] for call in calls] == [
             {"page": 1, "pageSize": 2},
             {"page": 2, "pageSize": 2},
@@ -866,6 +905,33 @@ class TestCleanupRemoval:
         client.execute_removal(QueueItem(10, 20, "Example", "blocklist", "manual_import", []), 1, 1)
 
         assert post_calls == []
+
+
+class TestCleanerLoop:
+    def test_cleaner_start_log_uses_defence_name(self, caplog) -> None:
+        import logging
+
+        caplog.set_level(logging.INFO)
+
+        class Shutdown:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def is_set(self) -> bool:
+                return self.calls > 0
+
+            def wait(self, timeout: int) -> bool:
+                self.calls += 1
+                return True
+
+        run_cleaner_loop(
+            [],
+            {"interval": 1, "batch_size": 0, "stagger_interval_seconds": 0},
+            Shutdown(),
+        )
+
+        assert "Warden-Defence started" in caplog.text
+        assert "Killarr" not in caplog.text
 
 
 class TestStallDetection:
@@ -1061,6 +1127,32 @@ class TestSearchCycle:
 
         assert searches == []
 
+    def test_queue_size_check_uses_short_timeout(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"fetch_timeout_seconds": 120, "queue_check_timeout_seconds": 12, "max_queue_size": 500},
+            {},
+        )
+        timeouts = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"totalRecords": 1}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            timeouts.append(timeout)
+            return Response()
+
+        client.session.get = get
+
+        assert not client.is_queue_too_large()
+        assert timeouts == [12]
+
 
 class TestRadarrCollection:
     def test_radarr_collection_search_falls_back_to_movie_search_when_off(self) -> None:
@@ -1231,6 +1323,7 @@ class TestSettingsSchema:
         assert SEARCH_SETTINGS_SCHEMA["search_after_cleanup_actions"]["default"] == ["retry", "blocklist"]
         assert SEARCH_SETTINGS_SCHEMA["search_jitter_seconds"]["default"] == 0
         assert SEARCH_SETTINGS_SCHEMA["radarr_collection_search_mode"]["default"] == "off"
+        assert SEARCH_SETTINGS_SCHEMA["queue_check_timeout_seconds"]["default"] == 15
 
     def test_hardening_cleanup_schema_defaults(self) -> None:
         assert CLEANUP_SETTINGS_SCHEMA["cleanup_page_size"]["default"] == 100

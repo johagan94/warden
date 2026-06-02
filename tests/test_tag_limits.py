@@ -128,6 +128,25 @@ class TestSonarrTagLimits:
 
         assert client.get_media_to_search(0, 0) == []
 
+    def test_tag_limits_do_not_disable_upgrade_searches(self) -> None:
+        client = _make_sonarr({3: 10})
+        client._fetch_list = lambda endpoint, params=None: []
+        client._fetch_unlimited = lambda endpoint: (
+            [
+                {
+                    "id": 100,
+                    "episodeId": 100,
+                    "series": {"id": 55, "title": "Upgradeable Show", "tags": [3]},
+                }
+            ]
+            if "cutoff" in endpoint
+            else []
+        )
+
+        items = client.get_media_to_search(0, 5)
+
+        assert items == [("series:55", "upgrade", "Upgradeable Show")]
+
     def test_emitted_series_items_trigger_series_search(self) -> None:
         client = _make_sonarr({3: 10})
         client._fetch_list = lambda endpoint, params=None: [_series(55, tags=[3])]
