@@ -189,6 +189,9 @@ def classify_stall(messages: list[str]) -> str:
         return "no_messages"
 
     combined = " ".join(messages).lower()
+    for category in ("dangerous_file", "missing_items"):
+        if any(pattern in combined for pattern in _CATEGORY_MAP[category]):
+            return category
     return next(
         (cat for cat, patterns in _CATEGORY_MAP.items() if any(pattern in combined for pattern in patterns)),
         "unknown",

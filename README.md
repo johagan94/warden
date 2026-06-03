@@ -56,13 +56,13 @@ For Sonarr on large libraries, see [Per-Tag Search Limits](#per-tag-search-limit
 instances:
   sonarr-instance:
     type: sonarr
-    search_type: series        # Search entire series instead of individual episodes
+    search_type: episode       # Safest Sonarr default; pair with season_packs for broader searches
   lidarr-instance:
     type: lidarr
     search_type: artist        # Search entire artist instead of individual albums
 ```
 
-**Note:** `series` search uses `SeriesSearch` with `seriesId`, which is more efficient than triggering individual episode searches.
+**Note:** `series` search uses `SeriesSearch` with `seriesId`. It is efficient in API call count, but it asks Sonarr to search the whole series and can create broad grab patterns. Prefer `season_packs` when you want pack-oriented searches without expanding every cleanup replacement into a whole-series search.
 
 ### Collection Search (Radarr)
 
@@ -99,7 +99,7 @@ vigilance:                          # legacy alias: global
   fetch_record_limit: 0             # Cap records pulled per wanted fetch (0 = unlimited)
   fetch_timeout_seconds: 120        # HTTP request timeout
   queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
-  max_queue_size: 500               # Pause if queue >= this (0 = disabled)
+  max_queue_size: 500               # Vigilance only: pause searches if queue >= this (0 = disabled)
   circuit_breaker_threshold: 3      # Skip instance after N consecutive failures
   interleave_instances: false       # Alternate between instances in search queue
   interleave_types: true            # Alternate between missing and upgrade searches
@@ -168,7 +168,7 @@ defence:                            # legacy alias: cleanup
   stagger_interval_seconds: 5       # Delay between removals
   circuit_breaker_threshold: 3      # Skip after N consecutive failures
   cleanup_page_size: 100            # Queue records per API request
-  max_cleanup_queue_records: 0      # Cap total records fetched (0 = unlimited)
+  max_cleanup_queue_records: 0      # Defence scan safety cap only; does not pause cleanup based on queue size
   max_removals_per_instance: 25     # Per-instance removal cap per cycle (0 = no cap)
   delete_timeout_seconds: 15        # Timeout for queue deletion calls
   fetch_timeout_seconds: 30         # HTTP timeout for queue fetches
@@ -247,7 +247,7 @@ instances:
     search_type: artist
   sonarr-instance:
     type: sonarr
-    max_queue_size: 200              # Override Vigilance queue-pause threshold
+    max_queue_size: 200              # Override Vigilance queue-pause threshold; cleanup ignores this
     tag_limits: { anime: 10 }        # Per-tag search caps apply per instance
 ```
 

@@ -29,7 +29,7 @@ vigilance:
   fetch_timeout_seconds: 120        # HTTP request timeout
   queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
   circuit_breaker_threshold: 3      # Skip instance after 3 consecutive fetch failures
-  max_queue_size: 500               # Pause searches if queue >= 500 items (0 = disabled)
+  max_queue_size: 500               # Vigilance only: pause searches if queue >= 500 items (0 = disabled)
   api_request_interval_seconds: 2   # Minimum delay between mutating API calls per instance
   search_jitter_seconds: 3          # Random extra delay before search commands to avoid bursts
   search_after_cleanup: true        # Search replacement after retry/blocklist cleanup
@@ -50,7 +50,7 @@ defence:
   batch_size: -1                    # Process all stalled items each cycle
   circuit_breaker_threshold: 3      # Skip cleanup after 3 consecutive failures
   cleanup_page_size: 100            # Queue records per API request during cleanup
-  max_cleanup_queue_records: 0      # 0 = unlimited, positive = cap total records fetched
+  max_cleanup_queue_records: 0      # Defence scan safety cap only; does not pause cleanup based on queue size
   max_removals_per_instance: 25     # Per-instance cleanup cap each cycle; 0 = no cap
   delete_timeout_seconds: 60        # Timeout for queue deletion calls (increase if *Arr is slow)
   retry_interval_minutes: 0         # Cooldown before re-evaluating removed items (0 = off)
@@ -89,7 +89,8 @@ instances:
     host: "http://<sonarr-host>:<port>"
     api_key: "${SONARR_API_KEY}"
     enabled: true
-    search_type: series             # Per-series SeriesSearch (not per episode)
+    search_type: episode            # episode is safest; use season_packs for broader searches
+    season_packs: true              # Prefer SeasonSearch over whole-series SeriesSearch
     # tag_limits (Sonarr): search at most N *series* per tag each cycle instead of
     # paging the entire wanted/missing set. Each entry fires one SeriesSearch, so
     # Sonarr resolves season packs with per-episode fallback (series > season >
