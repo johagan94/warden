@@ -732,8 +732,8 @@ class TestCleanupRemoval:
         assert records == [{"id": 1}, {"id": 2}, {"id": 3}]
         assert fetch_failed is False
         assert [call[1] for call in calls] == [
-            {"page": 1, "pageSize": 2},
-            {"page": 2, "pageSize": 2},
+            {"page": 1, "pageSize": 2, "includeUnknownSeriesItems": "true"},
+            {"page": 2, "pageSize": 2, "includeUnknownSeriesItems": "true"},
         ]
 
     def test_cleanup_cycle_continues_after_item_failure(self) -> None:
@@ -1152,6 +1152,73 @@ class TestSearchCycle:
 
         assert not client.is_queue_too_large()
         assert timeouts == [12]
+
+    def test_queue_size_check_counts_unknown_series_items(self) -> None:
+        # Regression: the queue-size safeguard must count the ENTIRE queue, including
+        # items the *arr cannot map to a series (includeUnknownSeriesItems=true).
+        # Counting only known-series items let unmapped/orphaned downloads pile up
+        # without ever tripping max_queue_size, so Vigilance flooded the queue.
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"max_queue_size": 500},
+            {},
+        )
+        captured: dict = {}
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"totalRecords": 4000}
+
+        def get(url: str, *, params: dict, timeout: int) -> "Response":
+            captured.update(params)
+            return Response()
+
+        client.session.get = get
+
+        assert client.is_queue_too_large()
+        assert captured.get("includeUnknownSeriesItems") == "true"
+
+    def test_queue_size_check_uses_client_specific_unknown_param(self) -> None:
+        # The include-unknown query param is *arr-specific: Sonarr/Radarr/Lidarr each
+        # name it differently. Using the wrong name silently undercounts the queue.
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"totalRecords": 0}
+
+        cases = [
+            (SonarrClient, "includeUnknownSeriesItems"),
+            (RadarrClient, "includeUnknownMovieItems"),
+            (LidarrClient, "includeUnknownArtistItems"),
+        ]
+        for client_cls, expected_param in cases:
+            client = client_cls("inst", "http://arr", "abc123", {"max_queue_size": 1}, {})
+            captured: dict = {}
+
+            def get(url: str, *, params: dict, timeout: int, _c: dict = captured) -> Response:
+                _c.update(params)
+                return Response()
+
+            client.session.get = get
+            client.is_queue_too_large()
+            assert captured.get(expected_param) == "true", client_cls.__name__
+
+    def test_get_media_id_falls_back_to_queue_id_for_unmapped_items(self) -> None:
+        # Defence now fetches unmapped/unknown queue items; _get_media_id must not
+        # KeyError on records lacking episodeId/movieId — fall back to the queue id.
+        sonarr = SonarrClient("s", "http://s", "k", {}, {})
+        assert sonarr._get_media_id({"id": 77}) == 77
+        assert sonarr._get_media_id({"id": 77, "seriesId": 9, "episodeId": 5}) == 5
+        radarr = RadarrClient("r", "http://r", "k", {}, {})
+        assert radarr._get_media_id({"id": 88}) == 88
+        assert radarr._get_media_id({"id": 88, "movieId": 6}) == 6
 
 
 class TestRadarrCollection:

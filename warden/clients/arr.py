@@ -55,6 +55,9 @@ class CircuitBreaker:
 
 class ArrClient(ABC):
     DEFAULT_FETCH_PAGE_SIZE = 2000
+    # Query param the *arr uses to include queue items it cannot map to library media.
+    # Sonarr-flavoured here; Radarr/Lidarr override with their movie/artist variants.
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownSeriesItems"
     ENDPOINT_COMMAND = "/api/v3/command"
     ENDPOINT_QUALITY_PROFILE = "/api/v3/qualityprofile"
     ENDPOINT_QUEUE = "/api/v3/queue"
@@ -474,7 +477,12 @@ class ArrClient(ABC):
             return True
         try:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
-            params: RequestParams = {"page": 1, "pageSize": 1, "includeUnknownSeriesItems": "false"}
+            # Count the ENTIRE queue, including items the *arr cannot map to library media.
+            # With the include-unknown flag off, the *arr drops unmapped items from
+            # totalRecords, so a queue flooded with unmapped/orphaned downloads never
+            # reaches max_queue_size and Vigilance keeps searching without bound. This
+            # safeguard caps total queue load, so every queued item must be counted.
+            params: RequestParams = {"page": 1, "pageSize": 1, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
             response = self.session.get(url, params=params, timeout=self.queue_check_timeout)
             response.raise_for_status()
             total = cast(int, response.json().get("totalRecords", 0))
@@ -498,7 +506,9 @@ class ArrClient(ABC):
         cleanup_timeout = self.cleanup_settings.get("fetch_timeout_seconds", 30)
         while True:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
-            params = {"page": current_page, "pageSize": page_size}
+            # Include unmapped/unknown items so Defence can see and clear orphaned queue
+            # entries too — the same items Vigilance's safeguard must count.
+            params = {"page": current_page, "pageSize": page_size, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
             try:
                 response = self.session.get(url, params=params, timeout=cleanup_timeout)
                 response.raise_for_status()
@@ -757,6 +767,7 @@ class LidarrClient(ArrClient):
     ENDPOINT_TAG = "/api/v1/tag"
     ENDPOINT_WANTED_CUTOFF = "/api/v1/wanted/cutoff"
     ENDPOINT_WANTED_MISSING = "/api/v1/wanted/missing"
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownArtistItems"
     ARTIST_ID_PREFIX = "artist:"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -876,6 +887,7 @@ class RadarrClient(ArrClient):
     ENDPOINT_COLLECTION = "/api/v3/collection"
     ENDPOINT_MOVIE = "/api/v3/movie"
     ENDPOINT_MOVIE_FILE = "/api/v3/moviefile"
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownMovieItems"
     COLLECTION_ID_PREFIX = "collection:"
     MOVIE_FILE_BATCH_SIZE = 100
 
@@ -926,7 +938,8 @@ class RadarrClient(ArrClient):
         return cast(bool, record.get("isAvailable", True))
 
     def _get_media_id(self, record: Record) -> int:
-        return cast(int, record["movieId"])
+        # Fall back to the queue record id for unmapped/unknown queue items.
+        return cast(int, record.get("movieId") or record["id"])
 
     def _fetch_movie_collection_map(self) -> dict[int, tuple[int, str]]:
         """Return {movie_id: (collection_id, collection_title)} for all movies in a collection."""
@@ -1192,7 +1205,9 @@ class SonarrClient(ArrClient):
             season_number = record.get("seasonNumber")
             if season_number is not None:
                 return f"{self.SEASON_ID_PREFIX}{series_id}:{season_number}"
-        return cast(int | str, record["episodeId"])
+        # Fall back to the queue record id for items the *arr could not map to an
+        # episode (unmapped/unknown queue items) so cleanup never KeyErrors on them.
+        return cast(int | str, record.get("episodeId") or record["id"])
 
     def _extra_fetch_params(self) -> dict[str, str]:
         return {"includeSeries": "true", "monitored": "true"}
