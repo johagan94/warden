@@ -715,8 +715,11 @@ class ArrClient(ABC):
              honour a plain removal — so this clears the queue item instead of failing
              every cycle forever.
 
-        A 404 is treated as success (the item was already gone / removed via cascade).
-        Records the cleanup cooldown on success. Returns True if removed, else False.
+        A 404 counts as "already gone" (success) only after the ``removeFromClient=false``
+        fallback has also been tried, so an orphan's 404 cannot mask a removal that never
+        happened. Non-404 errors do NOT trigger the keep-client fallback (the item may be
+        legitimately in the client), so they retry next cycle as before. Records the cleanup
+        cooldown on success. Returns True if removed, else False.
         """
         base_params: dict[str, str] = {"removeFromClient": "true"}
         wants_blocklist = item.action == "blocklist"
@@ -729,18 +732,15 @@ class ArrClient(ABC):
 
         url = f"{self.url}{self.ENDPOINT_QUEUE}/{item.queue_id}"
         last_error: Exception | None = None
+        saw_not_found = False
         for attempt_idx, (params, effective_action) in enumerate(attempts):
             is_fallback = attempt_idx > 0
             try:
                 self._throttle_mutating_request()
                 response = self.session.delete(url, params=params, timeout=self.delete_timeout_seconds)
                 if response.status_code == 404:
-                    logger.info(
-                        f"[{self.name}] Removed ({item.action}, {item.category}, cascade): "
-                        f"{item.title} ({index}/{total})"
-                    )
-                    self._record_cleanup_retry(item.media_id, item.title)
-                    return True
+                    saw_not_found = True
+                    break  # no tracked download to remove from client; try keep-client removal
                 response.raise_for_status()
                 detail = f"{effective_action}, {item.category}" + (", fallback" if is_fallback else "")
                 logger.info(f"[{self.name}] Removed ({detail}): {item.title} ({index}/{total})")
@@ -753,6 +753,26 @@ class ArrClient(ABC):
                         f"[{self.name}] Blocklist-remove failed for {item.title} "
                         f"(ID: {item.queue_id}): {error}. Retrying as plain remove."
                     )
+
+        if saw_not_found:
+            # Orphaned queue record (no tracked download) — e.g. downloadClientUnavailable
+            # items grabbed but never realised in the client. Drop it without touching the
+            # client; a 404 here means it is genuinely gone.
+            try:
+                self._throttle_mutating_request()
+                response = self.session.delete(
+                    url, params={"removeFromClient": "false"}, timeout=self.delete_timeout_seconds
+                )
+                if response.status_code == 404 or response.ok:
+                    logger.info(
+                        f"[{self.name}] Removed ({item.action}, {item.category}, no client item): "
+                        f"{item.title} ({index}/{total})"
+                    )
+                    self._record_cleanup_retry(item.media_id, item.title)
+                    return True
+                response.raise_for_status()
+            except requests.RequestException as error:
+                last_error = error
 
         logger.error(
             f"[{self.name}] Failed to remove {item.title} (ID: {item.queue_id}) "

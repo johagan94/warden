@@ -736,6 +736,55 @@ class TestCleanupRemoval:
             {"page": 2, "pageSize": 2, "includeUnknownSeriesItems": "true"},
         ]
 
+    def test_delete_queue_item_falls_back_to_keep_client_on_404(self) -> None:
+        # downloadClientUnavailable orphans have no tracked download: removeFromClient=true
+        # 404s every cycle, and the *arr only drops them when asked NOT to remove from the
+        # client. Without the fallback they 404 forever and the queue never clears.
+        import requests
+
+        client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
+        calls: list[dict] = []
+
+        class Resp:
+            def __init__(self, code: int) -> None:
+                self.status_code = code
+                self.ok = 200 <= code < 300
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise requests.HTTPError(str(self.status_code))
+
+        def delete(url: str, *, params: dict, timeout: int) -> Resp:
+            calls.append(params)
+            return Resp(404) if params.get("removeFromClient") == "true" else Resp(200)
+
+        client.session.delete = delete
+        item = QueueItem(123, 5, "Orphan", "remove", "download_unavailable", [], "")
+        assert client._delete_queue_item(item, 1, 1) is True
+        assert any(p.get("removeFromClient") == "false" for p in calls)
+
+    def test_delete_queue_item_keep_client_fallback_not_used_for_normal_removal(self) -> None:
+        # A normal in-client item is removed with removeFromClient=true on the first try;
+        # the keep-client fallback must NOT fire, so a real client download is never orphaned.
+        client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
+        calls: list[dict] = []
+
+        class Resp:
+            status_code = 200
+            ok = True
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def delete(url: str, *, params: dict, timeout: int) -> Resp:
+            calls.append(params)
+            return Resp()
+
+        client.session.delete = delete
+        item = QueueItem(1, 2, "Normal", "remove", "stalled", [], "")
+        assert client._delete_queue_item(item, 1, 1) is True
+        assert calls == [{"removeFromClient": "true"}]
+
     def test_cleanup_cycle_continues_after_item_failure(self) -> None:
         calls = []
 

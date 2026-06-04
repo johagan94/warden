@@ -176,7 +176,11 @@ class TestRemovalFallback:
 
         client.execute_removal(self._item(), 1, 1)
 
-        assert len(calls) == 1  # 404 on first attempt = already gone
+        # A 404 to removeFromClient=true is ambiguous: "already gone" OR an orphan with no
+        # tracked download (e.g. downloadClientUnavailable). We disambiguate with a
+        # removeFromClient=false fallback; a 404 there too means genuinely gone -> success.
+        assert len(calls) == 2
+        assert calls[-1]["params"]["removeFromClient"] == "false"
         assert searches
         assert client._retry_state.get(55) is not None
 
