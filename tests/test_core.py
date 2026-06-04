@@ -864,13 +864,16 @@ class TestStallDetection:
         })
 
     def test_stalled_age_based_ignores_recent_items(self) -> None:
+        import datetime
+
         client = SonarrClient(
             "test", "http://sonarr:8989", "abc123", {}, {"queue_max_age_hours": 24}
         )
+        recent_added = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)).isoformat()
         assert not client._is_stalled({
             "status": "downloading",
             "trackedDownloadStatus": "ok",
-            "added": "2026-05-24T00:00:00Z",
+            "added": recent_added,
         })
 
     def test_download_unavailable_category_in_stall_categories(self) -> None:
@@ -909,6 +912,44 @@ class TestStallDetection:
         assert len(items) == 1
         assert items[0].category == "download_unavailable"
         assert items[0].action == "blocklist"
+
+
+class TestFetchLimits:
+    def test_fetch_unlimited_respects_record_limit(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"fetch_page_size": 2, "fetch_record_limit": 3},
+            {},
+        )
+        calls = []
+        pages = [
+            [{"id": 1}, {"id": 2}],
+            [{"id": 3}],
+        ]
+
+        class Response:
+            def __init__(self, records: list[dict]) -> None:
+                self._records = records
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"records": self._records}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response(pages[len(calls) - 1])
+
+        client.session.get = get
+
+        assert client._fetch_unlimited(client.ENDPOINT_WANTED_MISSING) == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert [call[1] for call in calls] == [
+            {"includeSeries": "true", "monitored": "true", "page": 1, "pageSize": 2},
+            {"includeSeries": "true", "monitored": "true", "page": 2, "pageSize": 1},
+        ]
 
 
 class TestSearchCycle:
@@ -1152,6 +1193,7 @@ class TestSettingsSchema:
         assert "circuit_breaker_threshold" in SEARCH_SETTINGS_SCHEMA
         assert "max_queue_size" in SEARCH_SETTINGS_SCHEMA
         assert "fetch_timeout_seconds" in SEARCH_SETTINGS_SCHEMA
+        assert "fetch_record_limit" in SEARCH_SETTINGS_SCHEMA
         assert SEARCH_SETTINGS_SCHEMA["circuit_breaker_threshold"]["default"] == 0
         assert SEARCH_SETTINGS_SCHEMA["max_queue_size"]["default"] == 0
         assert SEARCH_SETTINGS_SCHEMA["fetch_timeout_seconds"]["default"] == 120

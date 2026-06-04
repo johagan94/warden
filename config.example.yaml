@@ -22,6 +22,7 @@ global:
   interleave_instances: false       # Alternate searches between instances
   interleave_types: true            # Alternate missing and upgrade searches
   fetch_page_size: 2000             # Records per API request
+  fetch_record_limit: 0             # Max wanted records read per endpoint per cycle (0 = unlimited)
   fetch_timeout_seconds: 120        # HTTP request timeout
   circuit_breaker_threshold: 3      # Skip instance after 3 consecutive fetch failures
   max_queue_size: 500               # Pause searches if queue >= 500 items (0 = disabled)
@@ -30,7 +31,7 @@ global:
   search_after_cleanup: true        # Search replacement after retry/blocklist cleanup
   search_after_cleanup_actions: [retry, blocklist]
   radarr_collection_search_mode: "off" # off | detect | force (force is experimental)
-  season_packs: false               # Sonarr: false | true | ratio (0-1) | min episode count
+  season_packs: true                # Sonarr: season search with episode fallback
   include_tags: []                  # Optional *Arr tag labels to include
   exclude_tags: []                  # Optional *Arr tag labels to exclude
 
@@ -84,7 +85,7 @@ instances:
     host: "http://<sonarr-host>:<port>"
     api_key: "${SONARR_API_KEY}"
     enabled: true
-    search_type: series             # Per-series SeriesSearch (not per episode)
+    search_type: episode            # Keep SeriesSearch off; season_packs handles season-level searches
 
   radarr-instance:
     type: radarr

@@ -54,7 +54,7 @@ Control the granularity of search commands per instance:
 instances:
   sonarr-instance:
     type: sonarr
-    search_type: series        # Search entire series instead of individual episodes
+    search_type: episode       # Keep SeriesSearch off; use season_packs for season-level searches
   lidarr-instance:
     type: lidarr
     search_type: artist        # Search entire artist instead of individual albums
@@ -94,6 +94,7 @@ global:
   retry_interval_days_missing: 3    # Override for missing items only
   retry_interval_days_upgrade: 7    # Override for upgrade items only
   fetch_page_size: 2000             # Records per API request
+  fetch_record_limit: 0             # Max wanted records read per endpoint per cycle (0 = unlimited)
   fetch_timeout_seconds: 120        # HTTP request timeout
   max_queue_size: 500               # Pause if queue >= this (0 = disabled)
   circuit_breaker_threshold: 3      # Skip instance after N consecutive failures
@@ -109,7 +110,7 @@ global:
 
 #### Season Packs (Sonarr)
 
-Control when to search for entire seasons instead of individual episodes:
+Control when to search for entire seasons instead of individual episodes. For Sonarr, prefer `search_type: episode` with `season_packs` enabled; this lets Warden use `SeasonSearch` where it makes sense and fall back to `EpisodeSearch` for still-airing or partial seasons.
 
 ```yaml
 instances:

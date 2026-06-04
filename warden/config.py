@@ -49,6 +49,7 @@ SEARCH_SETTINGS_SCHEMA: SchemaMap = {
     "dry_run": {"default": False, "type": bool},
     "exclude_tags": {"default": [], "type": list, "element_type": str},
     "fetch_page_size": {"default": 2000, "type": int, "min_value": 1},
+    "fetch_record_limit": {"default": 0, "type": int, "min_value": 0},
     "fetch_timeout_seconds": {"default": 120, "type": int, "min_value": 5},
     "include_tags": {"default": [], "type": list, "element_type": str},
     "interleave_instances": {"default": False, "type": bool},

@@ -81,6 +81,7 @@ class ArrClient(ABC):
 
         self.dry_run = search_settings.get("dry_run", False) or cleanup_settings.get("dry_run", False)
         self.fetch_page_size = search_settings.get("fetch_page_size", self.DEFAULT_FETCH_PAGE_SIZE)
+        self.fetch_record_limit = search_settings.get("fetch_record_limit", 0)
         self.fetch_timeout = search_settings.get("fetch_timeout_seconds", 120)
         self.stagger_seconds = search_settings.get("stagger_interval_seconds", 30)
         self.search_order = search_settings.get("search_order", "last_searched_ascending")
@@ -165,13 +166,21 @@ class ArrClient(ABC):
         result: list[Record] = []
         current_page = 1
         page_size = self.fetch_page_size
+        record_cap = self.fetch_record_limit
         while True:
+            if record_cap > 0:
+                remaining = record_cap - len(result)
+                if remaining <= 0:
+                    break
+                page_size = min(self.fetch_page_size, remaining)
             params: RequestParams = {**self._extra_fetch_params(), "page": current_page, "pageSize": page_size}
             try:
                 response = self.session.get(url, params=params, timeout=self.fetch_timeout)
                 response.raise_for_status()
                 records = cast(list[Record], response.json().get("records", []))
                 result.extend(records)
+                if record_cap > 0 and len(result) >= record_cap:
+                    break
                 if len(records) < page_size:
                     break
                 current_page += 1
