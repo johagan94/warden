@@ -126,7 +126,13 @@ class ArrClient(ABC):
         self._exclude_tag_ids: set[int] = set()
         self._tag_limits_raw: dict[str, int] = dict(search_settings.get("tag_limits", {}) or {})
         self._tag_limit_ids: dict[int, int] = {}
-        self._resolve_tag_ids()
+        # Tag IDs are resolved later via resolve_tags(), once connectivity has been
+        # verified (see verify_arr_clients). Resolving here would race container
+        # startup: the *arr is frequently not yet accepting connections when clients
+        # are constructed, the single un-retried fetch fails, and tag filtering would
+        # be silently disabled for the whole run — making Warden search media the user
+        # excluded by tag.
+        self._tags_resolved = False
 
     # ----- abstract properties -----
 
@@ -224,24 +230,47 @@ class ArrClient(ABC):
 
     # ----- tag filtering -----
 
-    def _resolve_tag_ids(self) -> None:
+    def _configured_tag_names(self) -> tuple[list[str], list[str]]:
         include_names: list[str] = self.search_settings.get("include_tags", []) or self.cleanup_settings.get(
             "include_tags", []
         )
         exclude_names: list[str] = self.search_settings.get("exclude_tags", []) or self.cleanup_settings.get(
             "exclude_tags", []
         )
-        if include_names or exclude_names or self._tag_limits_raw:
-            url = f"{self.url}{self.ENDPOINT_TAG}"
-            try:
-                response = self.session.get(url, timeout=15)
-                response.raise_for_status()
-                tag_map = {tag["label"].lower(): tag["id"] for tag in response.json()}
-                self._include_tag_ids = self._resolve_tag_names(tag_map, include_names)
-                self._exclude_tag_ids = self._resolve_tag_names(tag_map, exclude_names)
-                self._tag_limit_ids = self._resolve_tag_limit_ids(tag_map)
-            except requests.RequestException as err:
-                logger.error(f"[{self.name}] Failed to fetch tags, tag filtering disabled: {err}")
+        return include_names, exclude_names
+
+    @property
+    def tags_configured(self) -> bool:
+        """Whether any tag-based filtering or per-tag limits are configured here."""
+        include_names, exclude_names = self._configured_tag_names()
+        return bool(include_names or exclude_names or self._tag_limits_raw)
+
+    def resolve_tags(self) -> bool:
+        """Resolve configured tag names to IDs against the *arr ``/tag`` endpoint.
+
+        Returns ``True`` if resolution succeeded or there is nothing to resolve, and
+        ``False`` only when a fetch was attempted and failed. Deferred out of
+        ``__init__`` and invoked after connectivity is verified, so a not-yet-ready
+        *arr can no longer silently disable tag filtering. Idempotent: a no-op once
+        resolved, so it is safe to retry.
+        """
+        if self._tags_resolved or not self.tags_configured:
+            self._tags_resolved = True
+            return True
+        include_names, exclude_names = self._configured_tag_names()
+        url = f"{self.url}{self.ENDPOINT_TAG}"
+        try:
+            response = self.session.get(url, timeout=self.fetch_timeout)
+            response.raise_for_status()
+            tag_map = {tag["label"].lower(): tag["id"] for tag in response.json()}
+        except requests.RequestException as err:
+            logger.error(f"[{self.name}] Failed to fetch tags: {err}")
+            return False
+        self._include_tag_ids = self._resolve_tag_names(tag_map, include_names)
+        self._exclude_tag_ids = self._resolve_tag_names(tag_map, exclude_names)
+        self._tag_limit_ids = self._resolve_tag_limit_ids(tag_map)
+        self._tags_resolved = True
+        return True
 
     def _resolve_tag_limit_ids(self, tag_map: dict[str, int]) -> dict[int, int]:
         result: dict[int, int] = {}
