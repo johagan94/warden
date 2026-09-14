@@ -42,7 +42,12 @@ def _seconds_until_window_open(start: datetime.time, now: datetime.time, today: 
 
 def _format_cycle_info(client_name: str, item_count: int, skip_stats: dict[str, int]) -> str:
     total_eval = skip_stats["total_evaluated"]
-    skipped = skip_stats["ignored"] + skip_stats["tag_filtered"] + skip_stats.get("retry_interval", 0)
+    skipped = (
+        skip_stats["ignored"]
+        + skip_stats["tag_filtered"]
+        + skip_stats.get("retry_interval", 0)
+        + skip_stats.get("duplicate_download", 0)
+    )
     protected = skip_stats.get("series_protected", 0)
     protected_str = f", SeriesProtected: {protected}" if protected else ""
     return f"[{client_name}] Found {item_count} items to remove (Evaluated: {total_eval}, Skipped: {skipped}{protected_str})."

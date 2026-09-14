@@ -27,6 +27,8 @@ vigilance:
                                     # Protects against huge libraries; for Sonarr prefer
                                     # per-instance tag_limits below.
   fetch_timeout_seconds: 120        # HTTP request timeout
+  http_retry_total: 2              # GET-only retries for transient DNS/connect/5xx failures
+  http_retry_backoff_seconds: 1    # Exponential retry backoff base; mutations are never retried
   queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
   circuit_breaker_threshold: 3      # Skip instance after 3 consecutive fetch failures
   max_queue_size: 500               # Vigilance only: pause searches if queue >= 500 items (0 = disabled)
@@ -51,6 +53,7 @@ defence:
   circuit_breaker_threshold: 3      # Skip cleanup after 3 consecutive failures
   cleanup_page_size: 100            # Queue records per API request during cleanup
   max_cleanup_queue_records: 0      # Defence scan safety cap only; does not pause cleanup based on queue size
+  max_cleanup_queue_pages: 100      # Hard pagination ceiling; prevents runaway memory use
   max_removals_per_instance: 25     # Per-instance cleanup cap each cycle; 0 = no cap
   delete_timeout_seconds: 60        # Timeout for queue deletion calls (increase if *Arr is slow)
   retry_interval_minutes: 0         # Cooldown before re-evaluating removed items (0 = off)

@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from typing import Any, NamedTuple, cast
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from warden.validators import classify_stall
 
@@ -92,11 +94,14 @@ class ArrClient(ABC):
         self.retry_interval_days_upgrade = search_settings.get("retry_interval_days_upgrade")
         self.api_request_interval_seconds = search_settings.get("api_request_interval_seconds", 0)
         self.search_jitter_seconds = search_settings.get("search_jitter_seconds", 0)
+        self.http_retry_total = search_settings.get("http_retry_total", 2)
+        self.http_retry_backoff_seconds = search_settings.get("http_retry_backoff_seconds", 1)
 
         self.max_queue_size = search_settings.get("max_queue_size", 0)
         self.cleanup_batch_size = cleanup_settings.get("batch_size", 10)
         self.cleanup_page_size = cleanup_settings.get("cleanup_page_size", 100)
         self.max_cleanup_queue_records = cleanup_settings.get("max_cleanup_queue_records", 0)
+        self.max_cleanup_queue_pages = cleanup_settings.get("max_cleanup_queue_pages", 100)
         self.cleanup_retry_minutes = cleanup_settings.get("retry_interval_minutes", 0)
         self.delete_timeout_seconds = cleanup_settings.get("delete_timeout_seconds", 15)
         self.queue_max_age_hours = cleanup_settings.get("queue_max_age_hours", 0)
@@ -120,6 +125,22 @@ class ArrClient(ABC):
 
         self.session = requests.Session()
         self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
+        if self.http_retry_total > 0:
+            retry = Retry(
+                total=self.http_retry_total,
+                connect=self.http_retry_total,
+                read=0,
+                status=self.http_retry_total,
+                other=0,
+                allowed_methods=frozenset({"GET"}),
+                status_forcelist=(429, 500, 502, 503, 504),
+                backoff_factor=self.http_retry_backoff_seconds,
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
 
         self._include_tag_ids: set[int] = set()
         self._exclude_tag_ids: set[int] = set()
@@ -513,21 +534,73 @@ class ArrClient(ABC):
         current_page = 1
         page_size = self.cleanup_page_size
         record_cap = self.max_cleanup_queue_records
+        page_cap = self.max_cleanup_queue_pages
         cleanup_timeout = self.cleanup_settings.get("fetch_timeout_seconds", 30)
+        seen_queue_ids: set[int | str] = set()
+        seen_page_signatures: set[tuple[int | str, ...]] = set()
+        expected_total: int | None = None
         while True:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
             params = {"page": current_page, "pageSize": page_size}
             try:
                 response = self._api_get(url, params=params, timeout=cleanup_timeout)
                 response.raise_for_status()
-                records = response.json().get("records", [])
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    logger.error(f"[{self.name}] Queue page {current_page} returned an invalid response payload.")
+                    fetch_failed = True
+                    break
+                records = payload.get("records", [])
+                if not isinstance(records, list):
+                    logger.error(f"[{self.name}] Queue page {current_page} returned an invalid records payload.")
+                    fetch_failed = True
+                    break
+                reported_total = payload.get("totalRecords")
+                if expected_total is None and isinstance(reported_total, int) and reported_total >= 0:
+                    expected_total = reported_total
+                page_signature = tuple(
+                    record.get("id", f"page:{current_page}:row:{index}") for index, record in enumerate(records)
+                )
+                if records and page_signature in seen_page_signatures:
+                    logger.error(
+                        f"[{self.name}] Queue pagination repeated page {current_page}; "
+                        "stopping to prevent unbounded memory use."
+                    )
+                    fetch_failed = True
+                    break
+                seen_page_signatures.add(page_signature)
+                unique_records = []
+                for record in records:
+                    queue_id = record.get("id")
+                    if queue_id is not None and queue_id in seen_queue_ids:
+                        continue
+                    if queue_id is not None:
+                        seen_queue_ids.add(queue_id)
+                    unique_records.append(record)
                 if record_cap > 0:
                     remaining = record_cap - len(result)
                     if remaining <= 0:
                         break
-                    records = records[:remaining]
-                result.extend(records)
-                if len(records) < page_size or (record_cap > 0 and len(result) >= record_cap):
+                    unique_records = unique_records[:remaining]
+                result.extend(unique_records)
+                if (
+                    len(records) < page_size
+                    or (expected_total is not None and len(result) >= expected_total)
+                    or (record_cap > 0 and len(result) >= record_cap)
+                ):
+                    break
+                if not unique_records:
+                    logger.error(
+                        f"[{self.name}] Queue pagination made no progress on page {current_page}; stopping safely."
+                    )
+                    fetch_failed = True
+                    break
+                if current_page >= page_cap:
+                    logger.error(
+                        f"[{self.name}] Queue pagination reached the safety limit of {page_cap} pages; "
+                        "stopping to prevent unbounded memory use."
+                    )
+                    fetch_failed = True
                     break
                 current_page += 1
             except requests.RequestException as error:
@@ -610,6 +683,7 @@ class ArrClient(ABC):
             "not_stalled": 0,
             "retry_interval": 0,
             "series_protected": 0,
+            "duplicate_download": 0,
         }
         if self._circuit_breaker_cleanup > 0 and self.circuit_breaker.is_open(f"{self.name}_cleanup"):
             logger.warning(f"[{self.name}] Circuit breaker open for cleanup — skipping.")
@@ -624,6 +698,7 @@ class ArrClient(ABC):
                 self.circuit_breaker.record_failure(f"{self.name}_cleanup")
             skip_series_ids = self._get_skip_series_ids(all_records)
             items: list[QueueItem] = []
+            seen_download_ids: set[str] = set()
             skip_stats = {
                 "total_evaluated": len(all_records),
                 "ignored": 0,
@@ -631,6 +706,7 @@ class ArrClient(ABC):
                 "not_stalled": 0,
                 "retry_interval": 0,
                 "series_protected": 0,
+                "duplicate_download": 0,
             }
 
             for record in all_records:
@@ -678,6 +754,14 @@ class ArrClient(ABC):
                     logger.debug(f"[{self.name}] Skipping stalled item (tag filter): {title}")
                     skip_stats["tag_filtered"] += 1
                     continue
+
+                download_id = record.get("downloadId")
+                if download_id and download_id in seen_download_ids:
+                    logger.debug(f"[{self.name}] Skipping duplicate queue row for download {download_id}: {title}")
+                    skip_stats["duplicate_download"] += 1
+                    continue
+                if isinstance(download_id, str) and download_id:
+                    seen_download_ids.add(download_id)
 
                 queue_id = record["id"]
                 added = record.get("added", "")

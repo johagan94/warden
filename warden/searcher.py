@@ -253,7 +253,10 @@ def run_search_cycle(
         try:
             if client.is_queue_too_large():
                 continue
-            candidates = client.get_media_to_search(global_missing, global_upgrade)
+            client_settings = getattr(client, "search_settings", {})
+            client_missing = client_settings.get("missing_batch_size", global_missing) if run_missing else 0
+            client_upgrade = client_settings.get("upgrade_batch_size", global_upgrade) if run_upgrade else 0
+            candidates = client.get_media_to_search(client_missing, client_upgrade)
         except Exception:
             failed_clients += 1
             logger.exception(f"[{client.name}] Search candidate fetch failed; continuing with remaining instances.")

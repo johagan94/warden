@@ -99,6 +99,8 @@ vigilance:                          # legacy alias: global
   fetch_record_limit: 0             # Cap records pulled per wanted fetch (0 = unlimited)
   fetch_timeout_seconds: 120        # HTTP request timeout
   queue_check_timeout_seconds: 15   # Short timeout for max_queue_size checks
+  http_retry_total: 2               # GET-only retries for transient DNS/connect/5xx failures
+  http_retry_backoff_seconds: 1     # Exponential backoff base in seconds
   max_queue_size: 500               # Vigilance only: pause searches if queue >= this (0 = disabled)
   circuit_breaker_threshold: 3      # Skip instance after N consecutive failures
   interleave_instances: false       # Alternate between instances in search queue
@@ -169,6 +171,7 @@ defence:                            # legacy alias: cleanup
   circuit_breaker_threshold: 3      # Skip after N consecutive failures
   cleanup_page_size: 100            # Queue records per API request
   max_cleanup_queue_records: 0      # Defence scan safety cap only; does not pause cleanup based on queue size
+  max_cleanup_queue_pages: 100      # Hard safety ceiling for queue pagination
   max_removals_per_instance: 25     # Per-instance removal cap per cycle (0 = no cap)
   delete_timeout_seconds: 15        # Timeout for queue deletion calls
   fetch_timeout_seconds: 30         # HTTP timeout for queue fetches

@@ -901,6 +901,96 @@ class TestCleanupRemoval:
             {"page": 2, "pageSize": 2},
         ]
 
+    def test_cleanup_queue_fetch_stops_at_reported_total(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 2, "max_cleanup_queue_records": 0},
+        )
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": 1}, {"id": 2}], "totalRecords": 2}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response()
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}]
+        assert fetch_failed is False
+        assert len(calls) == 1
+
+    def test_cleanup_queue_fetch_stops_on_repeated_page(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 2, "max_cleanup_queue_records": 0},
+        )
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": 1}, {"id": 2}], "totalRecords": 200}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response()
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}]
+        assert fetch_failed is True
+        assert len(calls) == 2
+
+    def test_cleanup_queue_fetch_enforces_page_safety_cap(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 1, "max_cleanup_queue_records": 0, "max_cleanup_queue_pages": 3},
+        )
+        calls = []
+
+        class Response:
+            def __init__(self, queue_id: int) -> None:
+                self.queue_id = queue_id
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": self.queue_id}]}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response(len(calls))
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert fetch_failed is True
+        assert len(calls) == 3
+
     def test_cleanup_ignores_search_queue_size_limit(self) -> None:
         client = SonarrClient(
             "sonarr-tv",
@@ -938,6 +1028,46 @@ class TestCleanupRemoval:
 
         assert stats["total_evaluated"] == 2
         assert [item.queue_id for item in items] == [10, 11]
+
+    def test_cleanup_deduplicates_rows_for_the_same_download(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"batch_size": -1, "stalled": "remove"},
+        )
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {
+                    "records": [
+                        {
+                            "id": 10,
+                            "episodeId": 20,
+                            "downloadId": "same-grab",
+                            "title": "Example Show - S01E01",
+                            "status": "failed",
+                        },
+                        {
+                            "id": 11,
+                            "episodeId": 21,
+                            "downloadId": "same-grab",
+                            "title": "Example Show - S01E02",
+                            "status": "failed",
+                        },
+                    ]
+                }
+
+        client.session.get = lambda url, *, params, timeout: Response()
+
+        items, stats = client.get_stalled_items()
+
+        assert [item.queue_id for item in items] == [10]
+        assert stats["duplicate_download"] == 1
 
     def test_cleanup_cycle_continues_after_item_failure(self) -> None:
         calls = []
@@ -1301,6 +1431,29 @@ class TestSearchCycle:
         )
 
         assert searches == [(123, "missing", "Good Movie")]
+
+    def test_search_cycle_honors_per_instance_batch_overrides(self) -> None:
+        requested = []
+
+        class Client:
+            name = "lidarr"
+            weight = 1
+            uses_tag_limits = False
+            search_settings = {"missing_batch_size": 0, "upgrade_batch_size": 0}
+
+            def is_queue_too_large(self) -> bool:
+                return False
+
+            def get_media_to_search(self, missing_batch_size: int, upgrade_batch_size: int):
+                requested.append((missing_batch_size, upgrade_batch_size))
+                return []
+
+        run_search_cycle(
+            [Client()],
+            {"missing_batch_size": 20, "upgrade_batch_size": 10, "stagger_interval_seconds": 0},
+        )
+
+        assert requested == [(0, 0)]
 
     def test_search_cycle_continues_when_queue_size_check_times_out(self) -> None:
         import requests
