@@ -70,6 +70,7 @@ SEARCH_SETTINGS_SCHEMA: SchemaMap = {
     "search_after_cleanup": {"default": True, "type": bool},
     "search_after_cleanup_actions": {"default": ["retry", "blocklist"], "type": list, "element_type": str},
     "search_order": {"default": "last_searched_ascending", "type": str, "choices": VALID_SEARCH_ORDERS},
+    "search_on_start": {"default": True, "type": bool},
     "search_jitter_seconds": {"default": 0, "type": int, "min_value": 0},
     "search_type": {"default": None, "type": str, "choices": VALID_SEARCH_TYPES},
     "season_packs": {"default": False, "custom_validator": _validate_season_packs},

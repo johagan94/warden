@@ -20,6 +20,7 @@ vigilance:
   missing_batch_size: 25            # Up to 25 missing items per cycle
   upgrade_batch_size: 0             # Upgrades disabled (enable with positive number)
   search_order: release_date_ascending
+  search_on_start: true             # false defers the first search until the configured interval elapses
   interleave_instances: false       # Alternate searches between instances
   interleave_types: true            # Alternate missing and upgrade searches
   fetch_page_size: 2000             # Records per API request

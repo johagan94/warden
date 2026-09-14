@@ -91,6 +91,7 @@ vigilance:                          # legacy alias: global
   missing_batch_size: 25            # Items searched per cycle (0 = disabled, -1 = unlimited)
   upgrade_batch_size: 0             # Upgrade searches per cycle (0 = disabled)
   search_order: release_date_ascending  # alphabetical_* | last_added_* | last_searched_* | release_date_* | random
+  search_on_start: true             # false defers the first search until the normal interval
   stagger_interval_seconds: 10      # Delay between individual search commands
   retry_interval_days: 5            # Skip items searched within this window
   retry_interval_days_missing: 3    # Override for missing items only

@@ -37,6 +37,7 @@ class TestConfigParsing:
             }
         )
         assert config["search_settings"]["circuit_breaker_threshold"] == 5
+        assert config["search_settings"]["search_on_start"] is True
 
     def test_section_aliases_vigilance_defence(self) -> None:
         # Canonical section names match WARDEN_MODE: vigilance=search, defence=cleanup.

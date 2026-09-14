@@ -312,8 +312,14 @@ def run_searcher_loop(active_clients: list[ArrClient], settings: dict[str, Any],
     active_hours = _get_setting(settings, "active_hours")
     parsed_window = parse_active_hours(active_hours) if active_hours else None
 
-    last_missing_run = -math.inf
-    last_upgrade_run = -math.inf
+    if _get_setting(settings, "search_on_start"):
+        last_missing_run = -math.inf
+        last_upgrade_run = -math.inf
+    else:
+        initial_time = time.monotonic()
+        last_missing_run = initial_time
+        last_upgrade_run = initial_time
+        logger.info("Initial search deferred; waiting for the configured search interval.")
 
     while True:
         if shutdown_event and shutdown_event.is_set():
