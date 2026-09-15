@@ -253,7 +253,10 @@ def run_search_cycle(
         try:
             if client.is_queue_too_large():
                 continue
-            candidates = client.get_media_to_search(global_missing, global_upgrade)
+            client_settings = getattr(client, "search_settings", {})
+            client_missing = client_settings.get("missing_batch_size", global_missing) if run_missing else 0
+            client_upgrade = client_settings.get("upgrade_batch_size", global_upgrade) if run_upgrade else 0
+            candidates = client.get_media_to_search(client_missing, client_upgrade)
         except Exception:
             failed_clients += 1
             logger.exception(f"[{client.name}] Search candidate fetch failed; continuing with remaining instances.")
@@ -309,8 +312,14 @@ def run_searcher_loop(active_clients: list[ArrClient], settings: dict[str, Any],
     active_hours = _get_setting(settings, "active_hours")
     parsed_window = parse_active_hours(active_hours) if active_hours else None
 
-    last_missing_run = -math.inf
-    last_upgrade_run = -math.inf
+    if _get_setting(settings, "search_on_start"):
+        last_missing_run = -math.inf
+        last_upgrade_run = -math.inf
+    else:
+        initial_time = time.monotonic()
+        last_missing_run = initial_time
+        last_upgrade_run = initial_time
+        logger.info("Initial search deferred; waiting for the configured search interval.")
 
     while True:
         if shutdown_event and shutdown_event.is_set():

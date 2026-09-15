@@ -5,11 +5,14 @@ from __future__ import annotations
 import datetime
 import logging
 import random
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any, NamedTuple, cast
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from warden.validators import classify_stall
 
@@ -94,11 +97,14 @@ class ArrClient(ABC):
         self.retry_interval_days_upgrade = search_settings.get("retry_interval_days_upgrade")
         self.api_request_interval_seconds = search_settings.get("api_request_interval_seconds", 0)
         self.search_jitter_seconds = search_settings.get("search_jitter_seconds", 0)
+        self.http_retry_total = search_settings.get("http_retry_total", 2)
+        self.http_retry_backoff_seconds = search_settings.get("http_retry_backoff_seconds", 1)
 
         self.max_queue_size = search_settings.get("max_queue_size", 0)
         self.cleanup_batch_size = cleanup_settings.get("batch_size", 10)
         self.cleanup_page_size = cleanup_settings.get("cleanup_page_size", 100)
         self.max_cleanup_queue_records = cleanup_settings.get("max_cleanup_queue_records", 0)
+        self.max_cleanup_queue_pages = cleanup_settings.get("max_cleanup_queue_pages", 100)
         self.cleanup_retry_minutes = cleanup_settings.get("retry_interval_minutes", 0)
         self.delete_timeout_seconds = cleanup_settings.get("delete_timeout_seconds", 15)
         self.queue_max_age_hours = cleanup_settings.get("queue_max_age_hours", 0)
@@ -113,6 +119,7 @@ class ArrClient(ABC):
         self._circuit_breaker_fetch = search_settings.get("circuit_breaker_threshold", 0)
         self._circuit_breaker_cleanup = cleanup_settings.get("circuit_breaker_threshold", 0)
         self._last_mutating_request = 0.0
+        self._api_request_lock = threading.RLock()
         self._time_func = time.monotonic
         self._sleep_func = time.sleep
 
@@ -121,6 +128,22 @@ class ArrClient(ABC):
 
         self.session = requests.Session()
         self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
+        if self.http_retry_total > 0:
+            retry = Retry(
+                total=self.http_retry_total,
+                connect=self.http_retry_total,
+                read=0,
+                status=self.http_retry_total,
+                other=0,
+                allowed_methods=frozenset({"GET"}),
+                status_forcelist=(429, 500, 502, 503, 504),
+                backoff_factor=self.http_retry_backoff_seconds,
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
 
         self._include_tag_ids: set[int] = set()
         self._exclude_tag_ids: set[int] = set()
@@ -161,10 +184,24 @@ class ArrClient(ABC):
 
     # ----- common HTTP utilities -----
 
+    def _api_get(self, url: str, **kwargs: Any) -> requests.Response:
+        with self._api_request_lock:
+            return self.session.get(url, **kwargs)
+
+    def _api_post_command(self, url: str, payload: dict[str, Any]) -> requests.Response:
+        with self._api_request_lock:
+            self._prepare_search_request()
+            return self.session.post(url, json=payload, timeout=self.fetch_timeout)
+
+    def _api_delete_queue_item(self, url: str, params: dict[str, str]) -> requests.Response:
+        with self._api_request_lock:
+            self._throttle_mutating_request()
+            return self.session.delete(url, params=params, timeout=self.delete_timeout_seconds)
+
     def _fetch_list(self, endpoint: str, params: RequestParams | None = None) -> list[Record]:
         url = f"{self.url}{endpoint}"
         try:
-            response = self.session.get(url, params=params or {}, timeout=self.fetch_timeout)
+            response = self._api_get(url, params=params or {}, timeout=self.fetch_timeout)
             response.raise_for_status()
             return cast(list[Record], response.json())
         except requests.RequestException as error:
@@ -180,7 +217,7 @@ class ArrClient(ABC):
         while True:
             params: RequestParams = {**self._extra_fetch_params(), "page": current_page, "pageSize": page_size}
             try:
-                response = self.session.get(url, params=params, timeout=self.fetch_timeout)
+                response = self._api_get(url, params=params, timeout=self.fetch_timeout)
                 response.raise_for_status()
                 records = cast(list[Record], response.json().get("records", []))
                 if record_limit > 0:
@@ -203,7 +240,7 @@ class ArrClient(ABC):
     def check_connection(self) -> bool:
         url = f"{self.url}{self.ENDPOINT_TAG}"
         try:
-            response = self.session.get(url, timeout=self.fetch_timeout)
+            response = self._api_get(url, timeout=self.fetch_timeout)
             response.raise_for_status()
             return True
         except requests.RequestException:
@@ -260,7 +297,7 @@ class ArrClient(ABC):
         include_names, exclude_names = self._configured_tag_names()
         url = f"{self.url}{self.ENDPOINT_TAG}"
         try:
-            response = self.session.get(url, timeout=self.fetch_timeout)
+            response = self._api_get(url, timeout=self.fetch_timeout)
             response.raise_for_status()
             tag_map = {tag["label"].lower(): tag["id"] for tag in response.json()}
         except requests.RequestException as err:
@@ -490,8 +527,7 @@ class ArrClient(ABC):
             url = f"{self.url}{self.ENDPOINT_COMMAND}"
             payload = {"name": self._command_name, self._id_field: [item_id]}
             try:
-                self._prepare_search_request()
-                response = self.session.post(url, json=payload, timeout=self.fetch_timeout)
+                response = self._api_post_command(url, payload)
                 response.raise_for_status()
                 logger.info(f"[{self.name}] Searching ({reason}): {title} ({index}/{total})")
             except requests.RequestException as error:
@@ -512,12 +548,15 @@ class ArrClient(ABC):
             # reaches max_queue_size and Vigilance keeps searching without bound. This
             # safeguard caps total queue load, so every queued item must be counted.
             params: RequestParams = {"page": 1, "pageSize": 1, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
-            response = self.session.get(url, params=params, timeout=self.queue_check_timeout)
+            response = self._api_get(url, params=params, timeout=self.queue_check_timeout)
             response.raise_for_status()
             total = cast(int, response.json().get("totalRecords", 0))
             if total >= self.max_queue_size:
                 logger.info(f"[{self.name}] Queue size ({total}) >= max ({self.max_queue_size}) — pausing searches.")
                 return False
+            return True
+        except requests.Timeout as error:
+            logger.warning(f"[{self.name}] Timed out checking queue size; continuing searches: {error}")
             return True
         except requests.RequestException as error:
             logger.error(f"[{self.name}] Failed to check queue size: {error}")
@@ -532,23 +571,75 @@ class ArrClient(ABC):
         current_page = 1
         page_size = self.cleanup_page_size
         record_cap = self.max_cleanup_queue_records
+        page_cap = self.max_cleanup_queue_pages
         cleanup_timeout = self.cleanup_settings.get("fetch_timeout_seconds", 30)
+        seen_queue_ids: set[int | str] = set()
+        seen_page_signatures: set[tuple[int | str, ...]] = set()
+        expected_total: int | None = None
         while True:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
             # Include unmapped/unknown items so Defence can see and clear orphaned queue
             # entries too — the same items Vigilance's safeguard must count.
             params = {"page": current_page, "pageSize": page_size, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
             try:
-                response = self.session.get(url, params=params, timeout=cleanup_timeout)
+                response = self._api_get(url, params=params, timeout=cleanup_timeout)
                 response.raise_for_status()
-                records = response.json().get("records", [])
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    logger.error(f"[{self.name}] Queue page {current_page} returned an invalid response payload.")
+                    fetch_failed = True
+                    break
+                records = payload.get("records", [])
+                if not isinstance(records, list):
+                    logger.error(f"[{self.name}] Queue page {current_page} returned an invalid records payload.")
+                    fetch_failed = True
+                    break
+                reported_total = payload.get("totalRecords")
+                if expected_total is None and isinstance(reported_total, int) and reported_total >= 0:
+                    expected_total = reported_total
+                page_signature = tuple(
+                    record.get("id", f"page:{current_page}:row:{index}") for index, record in enumerate(records)
+                )
+                if records and page_signature in seen_page_signatures:
+                    logger.error(
+                        f"[{self.name}] Queue pagination repeated page {current_page}; "
+                        "stopping to prevent unbounded memory use."
+                    )
+                    fetch_failed = True
+                    break
+                seen_page_signatures.add(page_signature)
+                unique_records = []
+                for record in records:
+                    queue_id = record.get("id")
+                    if queue_id is not None and queue_id in seen_queue_ids:
+                        continue
+                    if queue_id is not None:
+                        seen_queue_ids.add(queue_id)
+                    unique_records.append(record)
                 if record_cap > 0:
                     remaining = record_cap - len(result)
                     if remaining <= 0:
                         break
-                    records = records[:remaining]
-                result.extend(records)
-                if len(records) < page_size or (record_cap > 0 and len(result) >= record_cap):
+                    unique_records = unique_records[:remaining]
+                result.extend(unique_records)
+                if (
+                    len(records) < page_size
+                    or (expected_total is not None and len(result) >= expected_total)
+                    or (record_cap > 0 and len(result) >= record_cap)
+                ):
+                    break
+                if not unique_records:
+                    logger.error(
+                        f"[{self.name}] Queue pagination made no progress on page {current_page}; stopping safely."
+                    )
+                    fetch_failed = True
+                    break
+                if current_page >= page_cap:
+                    logger.error(
+                        f"[{self.name}] Queue pagination reached the safety limit of {page_cap} pages; "
+                        "stopping to prevent unbounded memory use."
+                    )
+                    fetch_failed = True
                     break
                 current_page += 1
             except requests.RequestException as error:
@@ -607,6 +698,15 @@ class ArrClient(ABC):
             action = self.cleanup_settings.get("stalled")
         return action or "ignore"
 
+    def _get_status_messages(self, record: Record) -> list[str]:
+        messages: list[str] = []
+        for msg_obj in record.get("statusMessages", []):
+            title = msg_obj.get("title")
+            if title:
+                messages.append(title)
+            messages.extend(msg_obj.get("messages", []))
+        return list(dict.fromkeys(messages))
+
     def _get_skip_series_ids(self, all_records: list[Record]) -> set[int]:
         """Return series IDs whose stalled items should be protected this cycle.
 
@@ -622,6 +722,7 @@ class ArrClient(ABC):
             "not_stalled": 0,
             "retry_interval": 0,
             "series_protected": 0,
+            "duplicate_download": 0,
         }
         if self._circuit_breaker_cleanup > 0 and self.circuit_breaker.is_open(f"{self.name}_cleanup"):
             logger.warning(f"[{self.name}] Circuit breaker open for cleanup — skipping.")
@@ -636,6 +737,7 @@ class ArrClient(ABC):
                 self.circuit_breaker.record_failure(f"{self.name}_cleanup")
             skip_series_ids = self._get_skip_series_ids(all_records)
             items: list[QueueItem] = []
+            seen_download_ids: set[str] = set()
             skip_stats = {
                 "total_evaluated": len(all_records),
                 "ignored": 0,
@@ -643,6 +745,7 @@ class ArrClient(ABC):
                 "not_stalled": 0,
                 "retry_interval": 0,
                 "series_protected": 0,
+                "duplicate_download": 0,
             }
 
             for record in all_records:
@@ -663,11 +766,7 @@ class ArrClient(ABC):
                     messages = []
                     action = self._resolve_cleanup_action(category)
                 else:
-                    messages = list(
-                        dict.fromkeys(
-                            msg for msg_obj in record.get("statusMessages", []) for msg in msg_obj.get("messages", [])
-                        )
-                    )
+                    messages = self._get_status_messages(record)
                     category = classify_stall(messages)
                     action = self._resolve_cleanup_action(category)
                     if category == "unknown":
@@ -694,6 +793,14 @@ class ArrClient(ABC):
                     logger.debug(f"[{self.name}] Skipping stalled item (tag filter): {title}")
                     skip_stats["tag_filtered"] += 1
                     continue
+
+                download_id = record.get("downloadId")
+                if download_id and download_id in seen_download_ids:
+                    logger.debug(f"[{self.name}] Skipping duplicate queue row for download {download_id}: {title}")
+                    skip_stats["duplicate_download"] += 1
+                    continue
+                if isinstance(download_id, str) and download_id:
+                    seen_download_ids.add(download_id)
 
                 queue_id = record["id"]
                 added = record.get("added", "")
@@ -765,8 +872,7 @@ class ArrClient(ABC):
         for attempt_idx, (params, effective_action) in enumerate(attempts):
             is_fallback = attempt_idx > 0
             try:
-                self._throttle_mutating_request()
-                response = self.session.delete(url, params=params, timeout=self.delete_timeout_seconds)
+                response = self._api_delete_queue_item(url, params)
                 if response.status_code == 404:
                     saw_not_found = True
                     break  # no tracked download to remove from client; try keep-client removal
@@ -920,8 +1026,7 @@ class LidarrClient(ArrClient):
                 url = f"{self.url}{self.ENDPOINT_COMMAND}"
                 payload = {"name": "ArtistSearch", "artistId": artist_id}
                 try:
-                    self._prepare_search_request()
-                    response = self.session.post(url, json=payload, timeout=self.fetch_timeout)
+                    response = self._api_post_command(url, payload)
                     response.raise_for_status()
                     logger.info(f"[{self.name}] Searching ({reason}): {title} ({index}/{total})")
                 except requests.RequestException as error:
@@ -962,8 +1067,7 @@ class RadarrClient(ArrClient):
             url = f"{self.url}{self.ENDPOINT_COMMAND}"
             payload = {"name": "CollectionSearch", "collectionIds": [collection_id]}
             try:
-                self._prepare_search_request()
-                response = self.session.post(url, json=payload, timeout=self.fetch_timeout)
+                response = self._api_post_command(url, payload)
                 response.raise_for_status()
                 logger.info(f"[{self.name}] Searching ({reason}, collection): {title} ({index}/{total})")
             except requests.RequestException as error:
@@ -1243,11 +1347,11 @@ class SonarrClient(ArrClient):
     def _is_available(self, record: Record) -> bool:
         return self._is_date_past(record.get("airDateUtc"))
 
+    def _extract_item(self, record: Record, reason: str) -> MediaItem:
+        return (record.get("episodeId") or record["id"], reason, self._get_record_title(record))
+
     def _get_media_id(self, record: Record) -> int | str:
         series_id = record.get("seriesId") or record.get("series", {}).get("id")
-        if self.search_type == "series":
-            if series_id is not None:
-                return f"{self.SERIES_ID_PREFIX}{series_id}"
         if self.cleanup_search_scope == "series" and series_id is not None:
             return f"{self.SERIES_ID_PREFIX}{series_id}"
         if self.cleanup_search_scope == "season" and series_id is not None:
@@ -1351,16 +1455,10 @@ class SonarrClient(ArrClient):
             if key in seen_seasons:
                 continue
             if self._is_season_still_airing(series_id, season_number, season_metadata):
-                title = self._get_record_title(record)
-                record_id = record.get("id")
-                if record_id:
-                    items.append((record_id, reason, title))
+                items.append(self._extract_item(record, reason))
                 continue
             if not self._meets_season_pack_threshold(series_id, season_number, season_record_counts, season_metadata):
-                title = self._get_record_title(record)
-                record_id = record.get("id")
-                if record_id:
-                    items.append((record_id, reason, title))
+                items.append(self._extract_item(record, reason))
                 continue
             seen_seasons.add(key)
             title = self._get_season_title(record, season_number)
@@ -1376,8 +1474,7 @@ class SonarrClient(ArrClient):
                 url = f"{self.url}{self.ENDPOINT_COMMAND}"
                 payload = {"name": "SeriesSearch", "seriesId": series_id}
                 try:
-                    self._prepare_search_request()
-                    response = self.session.post(url, json=payload, timeout=self.fetch_timeout)
+                    response = self._api_post_command(url, payload)
                     response.raise_for_status()
                     logger.info(f"[{self.name}] Searching ({reason}): {title} ({index}/{total})")
                 except requests.RequestException as error:
@@ -1397,8 +1494,7 @@ class SonarrClient(ArrClient):
             url = f"{self.url}{self.ENDPOINT_COMMAND}"
             payload = {"name": "SeasonSearch", "seriesId": series_id, "seasonNumber": season_number}
             try:
-                self._prepare_search_request()
-                response = self.session.post(url, json=payload, timeout=self.fetch_timeout)
+                response = self._api_post_command(url, payload)
                 response.raise_for_status()
                 logger.info(f"[{self.name}] Searching ({reason}): {title} ({index}/{total})")
             except requests.RequestException as error:

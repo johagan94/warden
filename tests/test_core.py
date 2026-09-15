@@ -1,5 +1,7 @@
 """Tests for Warden unified package."""
 
+from typing import Any
+
 from warden.cleaner import run_cleaner_loop, run_removal_cycle
 from warden.clients.arr import CircuitBreaker, LidarrClient, QueueItem, RadarrClient, SonarrClient
 from warden.config import CLEANUP_SETTINGS_SCHEMA, SEARCH_SETTINGS_SCHEMA, parse_config
@@ -35,6 +37,7 @@ class TestConfigParsing:
             }
         )
         assert config["search_settings"]["circuit_breaker_threshold"] == 5
+        assert config["search_settings"]["search_on_start"] is True
 
     def test_section_aliases_vigilance_defence(self) -> None:
         # Canonical section names match WARDEN_MODE: vigilance=search, defence=cleanup.
@@ -431,6 +434,18 @@ class TestStallClassifier:
         assert classify_stall(["Has fewer tracks than existing release"]) == "missing_items"
         assert classify_stall(["Has missing tracks"]) == "missing_items"
 
+    def test_classify_lidarr_album_match_with_missing_release_as_missing_items(self) -> None:
+        assert (
+            classify_stall(
+                [
+                    "One or more tracks expected in this release were not imported or missing from the release",
+                    "Album match is not close enough: 71.7 % vs 80 %",
+                    "Has missing tracks",
+                ]
+            )
+            == "missing_items"
+        )
+
     def test_classify_duplicate_artist_stays_unknown(self) -> None:
         # The duplicate-artist case must NOT be blocklisted/re-grabbed (a re-grab
         # can never fix a Lidarr metadata dupe); it stays unknown -> ignore on lidarr.
@@ -471,6 +486,54 @@ class TestStallClassifier:
         assert items == []
         assert stats["ignored"] == 1
         assert "Unrecognized status messages" not in caplog.text
+
+    def test_lidarr_queue_status_titles_are_classified(self) -> None:
+        client = LidarrClient(
+            "lidarr",
+            "http://lidarr:8686",
+            "abc123",
+            {"stagger_interval_seconds": 0},
+            {"missing_items": "blocklist", "manual_import": "remove"},
+        )
+        client.session.get = lambda url, *, params, timeout: type(
+            "R",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {
+                    "records": [
+                        {
+                            "id": 44,
+                            "albumId": 88,
+                            "status": "completed",
+                            "trackedDownloadStatus": "warning",
+                            "artist": {"artistName": "Armin van Buuren", "tags": []},
+                            "title": "A State Of Trance 2020",
+                            "statusMessages": [
+                                {
+                                    "title": (
+                                        "One or more tracks expected in this release were not imported "
+                                        "or missing from the release"
+                                    ),
+                                    "messages": [
+                                        "Album match is not close enough: 71.7 % vs 80 %",
+                                        "Has missing tracks",
+                                    ],
+                                }
+                            ],
+                        },
+                    ]
+                },
+            },
+        )()
+
+        items, stats = client.get_stalled_items()
+
+        assert stats["total_evaluated"] == 1
+        assert len(items) == 1
+        assert items[0].category == "missing_items"
+        assert items[0].action == "blocklist"
+        assert "One or more tracks expected" in items[0].messages[0]
 
 
 class TestCleanupRemoval:
@@ -554,7 +617,61 @@ class TestCleanupRemoval:
         assert items == [("series:55", "missing", "Steel Jeeg")]
         assert posts == [("http://sonarr:8989/api/v3/command", {"name": "SeriesSearch", "seriesId": 55}, 120)]
 
-    def test_sonarr_cleanup_uses_series_id_when_series_search_enabled(self) -> None:
+    def test_sonarr_episode_search_uses_episode_id_from_wanted_record(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"stagger_interval_seconds": 0},
+            {},
+        )
+        client._fetch_unlimited = lambda endpoint: [
+            {
+                "id": 999,
+                "episodeId": 100,
+                "airDateUtc": "2020-01-01T00:00:00Z",
+                "series": {"id": 55, "title": "Steel Jeeg", "tags": []},
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "title": "Launch",
+            },
+        ]
+
+        items = client.get_media_to_search(1, 0)
+
+        assert items == [(100, "missing", "Steel Jeeg - S01E01 - Launch")]
+
+    def test_sonarr_season_pack_episode_fallback_uses_episode_id(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"season_packs": 2, "stagger_interval_seconds": 0},
+            {},
+        )
+        client._fetch_list = lambda endpoint, params=None: [
+            {
+                "id": 55,
+                "seasons": [{"seasonNumber": 1, "statistics": {"episodeCount": 10}}],
+            }
+        ]
+        client._fetch_unlimited = lambda endpoint: [
+            {
+                "id": 999,
+                "episodeId": 100,
+                "airDateUtc": "2020-01-01T00:00:00Z",
+                "series": {"id": 55, "title": "Steel Jeeg", "tags": []},
+                "seasonNumber": 1,
+                "episodeNumber": 1,
+                "title": "Launch",
+            },
+        ]
+
+        items = client.get_media_to_search(1, 0)
+
+        assert items == [(100, "missing", "Steel Jeeg - S01E01 - Launch")]
+
+    def test_sonarr_cleanup_defaults_to_episode_id_when_series_search_enabled(self) -> None:
         client = SonarrClient(
             "sonarr-tv",
             "http://sonarr:8989",
@@ -563,7 +680,7 @@ class TestCleanupRemoval:
             {},
         )
 
-        assert client._get_media_id({"episodeId": 20, "seriesId": 55}) == "series:55"
+        assert client._get_media_id({"episodeId": 20, "seriesId": 55}) == 20
 
     def test_cleanup_search_scope_season_returns_season_id(self) -> None:
         client = SonarrClient(
@@ -631,8 +748,9 @@ class TestCleanupRemoval:
 
         assert client._get_media_id({"id": 123}) == 123
 
-    def test_cleanup_search_scope_series_type_takes_precedence_over_scope(self) -> None:
-        # search_type="series" always wins regardless of cleanup_search_scope
+    def test_cleanup_search_scope_takes_precedence_over_series_search_type(self) -> None:
+        # Vigilance can use SeriesSearch while Defence replacement searches stay scoped
+        # to the failed queue item.
         client = SonarrClient(
             "sonarr-tv",
             "http://sonarr:8989",
@@ -641,7 +759,7 @@ class TestCleanupRemoval:
             {"cleanup_search_scope": "season"},
         )
 
-        assert client._get_media_id({"episodeId": 20, "seriesId": 55, "seasonNumber": 2}) == "series:55"
+        assert client._get_media_id({"episodeId": 20, "seriesId": 55, "seasonNumber": 2}) == "season:55:2"
 
     def test_mutating_calls_are_throttled_when_interval_configured(self) -> None:
         client = SonarrClient(
@@ -665,6 +783,54 @@ class TestCleanupRemoval:
         client._throttle_mutating_request()
 
         assert sleeps == [1.0]
+
+    def test_concurrent_mutating_calls_share_throttle_interval(self) -> None:
+        import threading
+
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"api_request_interval_seconds": 0.05, "search_jitter_seconds": 0, "stagger_interval_seconds": 0},
+            {},
+        )
+        active_posts = 0
+        max_active_posts = 0
+        active_lock = threading.Lock()
+        both_inside = threading.Event()
+        start = threading.Event()
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def post(url: str, *, json: dict[str, Any], timeout: int) -> Response:
+            nonlocal active_posts, max_active_posts
+            with active_lock:
+                active_posts += 1
+                max_active_posts = max(max_active_posts, active_posts)
+                if active_posts == 2:
+                    both_inside.set()
+            both_inside.wait(timeout=0.05)
+            with active_lock:
+                active_posts -= 1
+            return Response()
+
+        def trigger(item_id: int) -> None:
+            start.wait(timeout=1)
+            client.trigger_search([(item_id, "missing", f"Episode {item_id}")])
+
+        client.session.post = post
+        first = threading.Thread(target=trigger, args=(20,))
+        second = threading.Thread(target=trigger, args=(21,))
+
+        first.start()
+        second.start()
+        start.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert max_active_posts == 1
 
     def test_search_jitter_delays_before_search_command(self) -> None:
         from warden.clients import arr as arr_module
@@ -736,10 +902,175 @@ class TestCleanupRemoval:
             {"page": 2, "pageSize": 2, "includeUnknownSeriesItems": "true"},
         ]
 
+    def test_cleanup_queue_fetch_stops_at_reported_total(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 2, "max_cleanup_queue_records": 0},
+        )
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": 1}, {"id": 2}], "totalRecords": 2}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response()
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}]
+        assert fetch_failed is False
+        assert len(calls) == 1
+
+    def test_cleanup_queue_fetch_stops_on_repeated_page(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 2, "max_cleanup_queue_records": 0},
+        )
+        calls = []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": 1}, {"id": 2}], "totalRecords": 200}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response()
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}]
+        assert fetch_failed is True
+        assert len(calls) == 2
+
+    def test_cleanup_queue_fetch_enforces_page_safety_cap(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"cleanup_page_size": 1, "max_cleanup_queue_records": 0, "max_cleanup_queue_pages": 3},
+        )
+        calls = []
+
+        class Response:
+            def __init__(self, queue_id: int) -> None:
+                self.queue_id = queue_id
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {"records": [{"id": self.queue_id}]}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            calls.append((url, params, timeout))
+            return Response(len(calls))
+
+        client.session.get = get
+
+        records, fetch_failed = client._fetch_all_queue()
+
+        assert records == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert fetch_failed is True
+        assert len(calls) == 3
+
+    def test_cleanup_ignores_search_queue_size_limit(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"max_queue_size": 1},
+            {"batch_size": -1, "stalled": "remove"},
+        )
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {
+                    "records": [
+                        {
+                            "id": 10,
+                            "episodeId": 20,
+                            "title": "Example Show - S01E01",
+                            "status": "failed",
+                        },
+                        {
+                            "id": 11,
+                            "episodeId": 21,
+                            "title": "Example Show - S01E02",
+                            "status": "failed",
+                        },
+                    ]
+                }
+
+        client.session.get = lambda url, *, params, timeout: Response()
+
+        items, stats = client.get_stalled_items()
+
+        assert stats["total_evaluated"] == 2
+        assert [item.queue_id for item in items] == [10, 11]
+
+    def test_cleanup_deduplicates_rows_for_the_same_download(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {},
+            {"batch_size": -1, "stalled": "remove"},
+        )
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, Any]:
+                return {
+                    "records": [
+                        {
+                            "id": 10,
+                            "episodeId": 20,
+                            "downloadId": "same-grab",
+                            "title": "Example Show - S01E01",
+                            "status": "failed",
+                        },
+                        {
+                            "id": 11,
+                            "episodeId": 21,
+                            "downloadId": "same-grab",
+                            "title": "Example Show - S01E02",
+                            "status": "failed",
+                        },
+                    ]
+                }
+
+        client.session.get = lambda url, *, params, timeout: Response()
+
+        items, stats = client.get_stalled_items()
+
+        assert [item.queue_id for item in items] == [10]
+        assert stats["duplicate_download"] == 1
+
     def test_delete_queue_item_falls_back_to_keep_client_on_404(self) -> None:
-        # downloadClientUnavailable orphans have no tracked download: removeFromClient=true
-        # 404s every cycle, and the *arr only drops them when asked NOT to remove from the
-        # client. Without the fallback they 404 forever and the queue never clears.
         import requests
 
         client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
@@ -761,11 +1092,9 @@ class TestCleanupRemoval:
         client.session.delete = delete
         item = QueueItem(123, 5, "Orphan", "remove", "download_unavailable", [], "")
         assert client._delete_queue_item(item, 1, 1) is True
-        assert any(p.get("removeFromClient") == "false" for p in calls)
+        assert any(params.get("removeFromClient") == "false" for params in calls)
 
     def test_delete_queue_item_keep_client_fallback_not_used_for_normal_removal(self) -> None:
-        # A normal in-client item is removed with removeFromClient=true on the first try;
-        # the keep-client fallback must NOT fire, so a real client download is never orphaned.
         client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
         calls: list[dict] = []
 
@@ -1148,7 +1477,30 @@ class TestSearchCycle:
 
         assert searches == [(123, "missing", "Good Movie")]
 
-    def test_search_cycle_skips_client_when_queue_size_check_times_out(self) -> None:
+    def test_search_cycle_honors_per_instance_batch_overrides(self) -> None:
+        requested = []
+
+        class Client:
+            name = "lidarr"
+            weight = 1
+            uses_tag_limits = False
+            search_settings = {"missing_batch_size": 0, "upgrade_batch_size": 0}
+
+            def is_queue_too_large(self) -> bool:
+                return False
+
+            def get_media_to_search(self, missing_batch_size: int, upgrade_batch_size: int):
+                requested.append((missing_batch_size, upgrade_batch_size))
+                return []
+
+        run_search_cycle(
+            [Client()],
+            {"missing_batch_size": 20, "upgrade_batch_size": 10, "stagger_interval_seconds": 0},
+        )
+
+        assert requested == [(0, 0)]
+
+    def test_search_cycle_continues_when_queue_size_check_times_out(self) -> None:
         import requests
 
         client = SonarrClient(
@@ -1158,23 +1510,30 @@ class TestSearchCycle:
             {"max_queue_size": 500, "stagger_interval_seconds": 0},
             {},
         )
-        searches = []
+        searches: list[Any] = []
 
-        def get(url: str, *, params: dict, timeout: int) -> None:
+        def get(url: str, *, params: dict[str, Any], timeout: int) -> None:
             raise requests.ReadTimeout("read timed out")
 
+        def get_media_to_search(missing_batch_size: int, upgrade_batch_size: int) -> list[tuple[int, str, str]]:
+            searches.append((missing_batch_size, upgrade_batch_size))
+            return [(123, "missing", "Should Search")]
+
+        def trigger_search(
+            items: list[tuple[int | str, str, str]], *, index: int | None = None, total: int | None = None
+        ) -> None:
+            searches.extend(items)
+
         client.session.get = get
-        client.get_media_to_search = lambda missing_batch_size, upgrade_batch_size: (
-            searches.append((missing_batch_size, upgrade_batch_size)) or [(123, "missing", "Should Not Search")]
-        )
-        client.trigger_search = lambda items, *, index=None, total=None: searches.extend(items)
+        client.get_media_to_search = get_media_to_search
+        client.trigger_search = trigger_search
 
         run_search_cycle(
             [client],
             {"missing_batch_size": 1, "upgrade_batch_size": 0, "stagger_interval_seconds": 0},
         )
 
-        assert searches == []
+        assert searches == [(1, 0), (123, "missing", "Should Search")]
 
     def test_queue_size_check_uses_short_timeout(self) -> None:
         client = SonarrClient(
@@ -1203,10 +1562,6 @@ class TestSearchCycle:
         assert timeouts == [12]
 
     def test_queue_size_check_counts_unknown_series_items(self) -> None:
-        # Regression: the queue-size safeguard must count the ENTIRE queue, including
-        # items the *arr cannot map to a series (includeUnknownSeriesItems=true).
-        # Counting only known-series items let unmapped/orphaned downloads pile up
-        # without ever tripping max_queue_size, so Vigilance flooded the queue.
         client = SonarrClient(
             "sonarr-tv",
             "http://sonarr:8989",
@@ -1223,7 +1578,7 @@ class TestSearchCycle:
             def json(self) -> dict:
                 return {"totalRecords": 4000}
 
-        def get(url: str, *, params: dict, timeout: int) -> "Response":
+        def get(url: str, *, params: dict, timeout: int) -> Response:
             captured.update(params)
             return Response()
 
@@ -1233,8 +1588,6 @@ class TestSearchCycle:
         assert captured.get("includeUnknownSeriesItems") == "true"
 
     def test_queue_size_check_uses_client_specific_unknown_param(self) -> None:
-        # The include-unknown query param is *arr-specific: Sonarr/Radarr/Lidarr each
-        # name it differently. Using the wrong name silently undercounts the queue.
         class Response:
             def raise_for_status(self) -> None:
                 return None
@@ -1251,8 +1604,8 @@ class TestSearchCycle:
             client = client_cls("inst", "http://arr", "abc123", {"max_queue_size": 1}, {})
             captured: dict = {}
 
-            def get(url: str, *, params: dict, timeout: int, _c: dict = captured) -> Response:
-                _c.update(params)
+            def get(url: str, *, params: dict, timeout: int, _captured: dict = captured) -> Response:
+                _captured.update(params)
                 return Response()
 
             client.session.get = get
@@ -1260,8 +1613,6 @@ class TestSearchCycle:
             assert captured.get(expected_param) == "true", client_cls.__name__
 
     def test_get_media_id_falls_back_to_queue_id_for_unmapped_items(self) -> None:
-        # Defence now fetches unmapped/unknown queue items; _get_media_id must not
-        # KeyError on records lacking episodeId/movieId — fall back to the queue id.
         sonarr = SonarrClient("s", "http://s", "k", {}, {})
         assert sonarr._get_media_id({"id": 77}) == 77
         assert sonarr._get_media_id({"id": 77, "seriesId": 9, "episodeId": 5}) == 5
