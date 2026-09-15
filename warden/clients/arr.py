@@ -58,6 +58,9 @@ class CircuitBreaker:
 
 class ArrClient(ABC):
     DEFAULT_FETCH_PAGE_SIZE = 2000
+    # Query param the *arr uses to include queue items it cannot map to library media.
+    # Sonarr-flavoured here; Radarr/Lidarr override with their movie/artist variants.
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownSeriesItems"
     ENDPOINT_COMMAND = "/api/v3/command"
     ENDPOINT_QUALITY_PROFILE = "/api/v3/qualityprofile"
     ENDPOINT_QUEUE = "/api/v3/queue"
@@ -146,7 +149,13 @@ class ArrClient(ABC):
         self._exclude_tag_ids: set[int] = set()
         self._tag_limits_raw: dict[str, int] = dict(search_settings.get("tag_limits", {}) or {})
         self._tag_limit_ids: dict[int, int] = {}
-        self._resolve_tag_ids()
+        # Tag IDs are resolved later via resolve_tags(), once connectivity has been
+        # verified (see verify_arr_clients). Resolving here would race container
+        # startup: the *arr is frequently not yet accepting connections when clients
+        # are constructed, the single un-retried fetch fails, and tag filtering would
+        # be silently disabled for the whole run — making Warden search media the user
+        # excluded by tag.
+        self._tags_resolved = False
 
     # ----- abstract properties -----
 
@@ -258,24 +267,47 @@ class ArrClient(ABC):
 
     # ----- tag filtering -----
 
-    def _resolve_tag_ids(self) -> None:
+    def _configured_tag_names(self) -> tuple[list[str], list[str]]:
         include_names: list[str] = self.search_settings.get("include_tags", []) or self.cleanup_settings.get(
             "include_tags", []
         )
         exclude_names: list[str] = self.search_settings.get("exclude_tags", []) or self.cleanup_settings.get(
             "exclude_tags", []
         )
-        if include_names or exclude_names or self._tag_limits_raw:
-            url = f"{self.url}{self.ENDPOINT_TAG}"
-            try:
-                response = self._api_get(url, timeout=15)
-                response.raise_for_status()
-                tag_map = {tag["label"].lower(): tag["id"] for tag in response.json()}
-                self._include_tag_ids = self._resolve_tag_names(tag_map, include_names)
-                self._exclude_tag_ids = self._resolve_tag_names(tag_map, exclude_names)
-                self._tag_limit_ids = self._resolve_tag_limit_ids(tag_map)
-            except requests.RequestException as err:
-                logger.error(f"[{self.name}] Failed to fetch tags, tag filtering disabled: {err}")
+        return include_names, exclude_names
+
+    @property
+    def tags_configured(self) -> bool:
+        """Whether any tag-based filtering or per-tag limits are configured here."""
+        include_names, exclude_names = self._configured_tag_names()
+        return bool(include_names or exclude_names or self._tag_limits_raw)
+
+    def resolve_tags(self) -> bool:
+        """Resolve configured tag names to IDs against the *arr ``/tag`` endpoint.
+
+        Returns ``True`` if resolution succeeded or there is nothing to resolve, and
+        ``False`` only when a fetch was attempted and failed. Deferred out of
+        ``__init__`` and invoked after connectivity is verified, so a not-yet-ready
+        *arr can no longer silently disable tag filtering. Idempotent: a no-op once
+        resolved, so it is safe to retry.
+        """
+        if self._tags_resolved or not self.tags_configured:
+            self._tags_resolved = True
+            return True
+        include_names, exclude_names = self._configured_tag_names()
+        url = f"{self.url}{self.ENDPOINT_TAG}"
+        try:
+            response = self._api_get(url, timeout=self.fetch_timeout)
+            response.raise_for_status()
+            tag_map = {tag["label"].lower(): tag["id"] for tag in response.json()}
+        except requests.RequestException as err:
+            logger.error(f"[{self.name}] Failed to fetch tags: {err}")
+            return False
+        self._include_tag_ids = self._resolve_tag_names(tag_map, include_names)
+        self._exclude_tag_ids = self._resolve_tag_names(tag_map, exclude_names)
+        self._tag_limit_ids = self._resolve_tag_limit_ids(tag_map)
+        self._tags_resolved = True
+        return True
 
     def _resolve_tag_limit_ids(self, tag_map: dict[str, int]) -> dict[int, int]:
         result: dict[int, int] = {}
@@ -510,7 +542,12 @@ class ArrClient(ABC):
             return True
         try:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
-            params: RequestParams = {"page": 1, "pageSize": 1, "includeUnknownSeriesItems": "false"}
+            # Count the ENTIRE queue, including items the *arr cannot map to library media.
+            # With the include-unknown flag off, the *arr drops unmapped items from
+            # totalRecords, so a queue flooded with unmapped/orphaned downloads never
+            # reaches max_queue_size and Vigilance keeps searching without bound. This
+            # safeguard caps total queue load, so every queued item must be counted.
+            params: RequestParams = {"page": 1, "pageSize": 1, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
             response = self._api_get(url, params=params, timeout=self.queue_check_timeout)
             response.raise_for_status()
             total = cast(int, response.json().get("totalRecords", 0))
@@ -541,7 +578,9 @@ class ArrClient(ABC):
         expected_total: int | None = None
         while True:
             url = f"{self.url}{self.ENDPOINT_QUEUE}"
-            params = {"page": current_page, "pageSize": page_size}
+            # Include unmapped/unknown items so Defence can see and clear orphaned queue
+            # entries too — the same items Vigilance's safeguard must count.
+            params = {"page": current_page, "pageSize": page_size, self.QUEUE_INCLUDE_UNKNOWN_PARAM: "true"}
             try:
                 response = self._api_get(url, params=params, timeout=cleanup_timeout)
                 response.raise_for_status()
@@ -812,8 +851,11 @@ class ArrClient(ABC):
              honour a plain removal — so this clears the queue item instead of failing
              every cycle forever.
 
-        A 404 is treated as success (the item was already gone / removed via cascade).
-        Records the cleanup cooldown on success. Returns True if removed, else False.
+        A 404 counts as "already gone" (success) only after the ``removeFromClient=false``
+        fallback has also been tried, so an orphan's 404 cannot mask a removal that never
+        happened. Non-404 errors do NOT trigger the keep-client fallback (the item may be
+        legitimately in the client), so they retry next cycle as before. Records the cleanup
+        cooldown on success. Returns True if removed, else False.
         """
         base_params: dict[str, str] = {"removeFromClient": "true"}
         wants_blocklist = item.action == "blocklist"
@@ -826,17 +868,14 @@ class ArrClient(ABC):
 
         url = f"{self.url}{self.ENDPOINT_QUEUE}/{item.queue_id}"
         last_error: Exception | None = None
+        saw_not_found = False
         for attempt_idx, (params, effective_action) in enumerate(attempts):
             is_fallback = attempt_idx > 0
             try:
                 response = self._api_delete_queue_item(url, params)
                 if response.status_code == 404:
-                    logger.info(
-                        f"[{self.name}] Removed ({item.action}, {item.category}, cascade): "
-                        f"{item.title} ({index}/{total})"
-                    )
-                    self._record_cleanup_retry(item.media_id, item.title)
-                    return True
+                    saw_not_found = True
+                    break  # no tracked download to remove from client; try keep-client removal
                 response.raise_for_status()
                 detail = f"{effective_action}, {item.category}" + (", fallback" if is_fallback else "")
                 logger.info(f"[{self.name}] Removed ({detail}): {item.title} ({index}/{total})")
@@ -849,6 +888,26 @@ class ArrClient(ABC):
                         f"[{self.name}] Blocklist-remove failed for {item.title} "
                         f"(ID: {item.queue_id}): {error}. Retrying as plain remove."
                     )
+
+        if saw_not_found:
+            # Orphaned queue record (no tracked download) — e.g. downloadClientUnavailable
+            # items grabbed but never realised in the client. Drop it without touching the
+            # client; a 404 here means it is genuinely gone.
+            try:
+                self._throttle_mutating_request()
+                response = self.session.delete(
+                    url, params={"removeFromClient": "false"}, timeout=self.delete_timeout_seconds
+                )
+                if response.status_code == 404 or response.ok:
+                    logger.info(
+                        f"[{self.name}] Removed ({item.action}, {item.category}, no client item): "
+                        f"{item.title} ({index}/{total})"
+                    )
+                    self._record_cleanup_retry(item.media_id, item.title)
+                    return True
+                response.raise_for_status()
+            except requests.RequestException as error:
+                last_error = error
 
         logger.error(
             f"[{self.name}] Failed to remove {item.title} (ID: {item.queue_id}) "
@@ -863,6 +922,7 @@ class LidarrClient(ArrClient):
     ENDPOINT_TAG = "/api/v1/tag"
     ENDPOINT_WANTED_CUTOFF = "/api/v1/wanted/cutoff"
     ENDPOINT_WANTED_MISSING = "/api/v1/wanted/missing"
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownArtistItems"
     ARTIST_ID_PREFIX = "artist:"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -981,6 +1041,7 @@ class RadarrClient(ArrClient):
     ENDPOINT_COLLECTION = "/api/v3/collection"
     ENDPOINT_MOVIE = "/api/v3/movie"
     ENDPOINT_MOVIE_FILE = "/api/v3/moviefile"
+    QUEUE_INCLUDE_UNKNOWN_PARAM = "includeUnknownMovieItems"
     COLLECTION_ID_PREFIX = "collection:"
     MOVIE_FILE_BATCH_SIZE = 100
 
@@ -1030,7 +1091,8 @@ class RadarrClient(ArrClient):
         return cast(bool, record.get("isAvailable", True))
 
     def _get_media_id(self, record: Record) -> int:
-        return cast(int, record["movieId"])
+        # Fall back to the queue record id for unmapped/unknown queue items.
+        return cast(int, record.get("movieId") or record["id"])
 
     def _fetch_movie_collection_map(self) -> dict[int, tuple[int, str]]:
         """Return {movie_id: (collection_id, collection_title)} for all movies in a collection."""
@@ -1296,7 +1358,9 @@ class SonarrClient(ArrClient):
             season_number = record.get("seasonNumber")
             if season_number is not None:
                 return f"{self.SEASON_ID_PREFIX}{series_id}:{season_number}"
-        return cast(int | str, record["episodeId"])
+        # Fall back to the queue record id for items the *arr could not map to an
+        # episode (unmapped/unknown queue items) so cleanup never KeyErrors on them.
+        return cast(int | str, record.get("episodeId") or record["id"])
 
     def _extra_fetch_params(self) -> dict[str, str]:
         return {"includeSeries": "true", "monitored": "true"}

@@ -115,6 +115,25 @@ def build_arr_clients(
     return clients
 
 
+def _resolve_client_tags(client: ArrClient) -> bool:
+    """Resolve a reachable client's tag filters, retrying transient fetch failures.
+
+    Returns True if tags resolved (or none are configured). Mirrors the connection
+    retry cadence; the client is reachable at this point, so this normally succeeds on
+    the first attempt and only retries a rare transient blip on the /tag endpoint.
+    """
+    for attempt in range(1, _MAX_CONNECTION_ATTEMPTS + 1):
+        if client.resolve_tags():
+            return True
+        if attempt < _MAX_CONNECTION_ATTEMPTS:
+            logger.info(
+                f"[{client.name}] Tag fetch attempt {attempt}/{_MAX_CONNECTION_ATTEMPTS} failed. "
+                f"Retrying in {_RETRY_DELAY_SECONDS}s..."
+            )
+            time.sleep(_RETRY_DELAY_SECONDS)
+    return False
+
+
 def verify_arr_clients(clients: list[ArrClient]) -> list[ArrClient]:
     verified: list[ArrClient] = []
     for client in clients:
@@ -135,8 +154,19 @@ def verify_arr_clients(clients: list[ArrClient]) -> list[ArrClient]:
                 logger.error(
                     f"[{client.name}] Could not connect after {_MAX_CONNECTION_ATTEMPTS} attempts. Skipping instance."
                 )
-        if connected:
-            verified.append(client)
+        if not connected:
+            continue
+        # Resolve tag filters only now that the instance is reachable. If the instance
+        # has tag filters configured but they cannot be fetched, skip it (fail closed)
+        # rather than search with filtering silently disabled — otherwise Warden would
+        # grab media the user excluded by tag.
+        if not _resolve_client_tags(client):
+            logger.error(
+                f"[{client.name}] Could not resolve tag filters after {_MAX_CONNECTION_ATTEMPTS} attempts. "
+                f"Skipping instance to avoid searching tag-excluded media."
+            )
+            continue
+        verified.append(client)
     return verified
 
 

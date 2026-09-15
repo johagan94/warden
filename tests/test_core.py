@@ -898,8 +898,8 @@ class TestCleanupRemoval:
         assert records == [{"id": 1}, {"id": 2}, {"id": 3}]
         assert fetch_failed is False
         assert [call[1] for call in calls] == [
-            {"page": 1, "pageSize": 2},
-            {"page": 2, "pageSize": 2},
+            {"page": 1, "pageSize": 2, "includeUnknownSeriesItems": "true"},
+            {"page": 2, "pageSize": 2, "includeUnknownSeriesItems": "true"},
         ]
 
     def test_cleanup_queue_fetch_stops_at_reported_total(self) -> None:
@@ -1069,6 +1069,50 @@ class TestCleanupRemoval:
 
         assert [item.queue_id for item in items] == [10]
         assert stats["duplicate_download"] == 1
+
+    def test_delete_queue_item_falls_back_to_keep_client_on_404(self) -> None:
+        import requests
+
+        client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
+        calls: list[dict] = []
+
+        class Resp:
+            def __init__(self, code: int) -> None:
+                self.status_code = code
+                self.ok = 200 <= code < 300
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise requests.HTTPError(str(self.status_code))
+
+        def delete(url: str, *, params: dict, timeout: int) -> Resp:
+            calls.append(params)
+            return Resp(404) if params.get("removeFromClient") == "true" else Resp(200)
+
+        client.session.delete = delete
+        item = QueueItem(123, 5, "Orphan", "remove", "download_unavailable", [], "")
+        assert client._delete_queue_item(item, 1, 1) is True
+        assert any(params.get("removeFromClient") == "false" for params in calls)
+
+    def test_delete_queue_item_keep_client_fallback_not_used_for_normal_removal(self) -> None:
+        client = SonarrClient("sonarr", "http://sonarr:8989", "k", {}, {})
+        calls: list[dict] = []
+
+        class Resp:
+            status_code = 200
+            ok = True
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def delete(url: str, *, params: dict, timeout: int) -> Resp:
+            calls.append(params)
+            return Resp()
+
+        client.session.delete = delete
+        item = QueueItem(1, 2, "Normal", "remove", "stalled", [], "")
+        assert client._delete_queue_item(item, 1, 1) is True
+        assert calls == [{"removeFromClient": "true"}]
 
     def test_cleanup_cycle_continues_after_item_failure(self) -> None:
         calls = []
@@ -1516,6 +1560,65 @@ class TestSearchCycle:
 
         assert not client.is_queue_too_large()
         assert timeouts == [12]
+
+    def test_queue_size_check_counts_unknown_series_items(self) -> None:
+        client = SonarrClient(
+            "sonarr-tv",
+            "http://sonarr:8989",
+            "abc123",
+            {"max_queue_size": 500},
+            {},
+        )
+        captured: dict = {}
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"totalRecords": 4000}
+
+        def get(url: str, *, params: dict, timeout: int) -> Response:
+            captured.update(params)
+            return Response()
+
+        client.session.get = get
+
+        assert client.is_queue_too_large()
+        assert captured.get("includeUnknownSeriesItems") == "true"
+
+    def test_queue_size_check_uses_client_specific_unknown_param(self) -> None:
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"totalRecords": 0}
+
+        cases = [
+            (SonarrClient, "includeUnknownSeriesItems"),
+            (RadarrClient, "includeUnknownMovieItems"),
+            (LidarrClient, "includeUnknownArtistItems"),
+        ]
+        for client_cls, expected_param in cases:
+            client = client_cls("inst", "http://arr", "abc123", {"max_queue_size": 1}, {})
+            captured: dict = {}
+
+            def get(url: str, *, params: dict, timeout: int, _captured: dict = captured) -> Response:
+                _captured.update(params)
+                return Response()
+
+            client.session.get = get
+            client.is_queue_too_large()
+            assert captured.get(expected_param) == "true", client_cls.__name__
+
+    def test_get_media_id_falls_back_to_queue_id_for_unmapped_items(self) -> None:
+        sonarr = SonarrClient("s", "http://s", "k", {}, {})
+        assert sonarr._get_media_id({"id": 77}) == 77
+        assert sonarr._get_media_id({"id": 77, "seriesId": 9, "episodeId": 5}) == 5
+        radarr = RadarrClient("r", "http://r", "k", {}, {})
+        assert radarr._get_media_id({"id": 88}) == 88
+        assert radarr._get_media_id({"id": 88, "movieId": 6}) == 6
 
 
 class TestRadarrCollection:
